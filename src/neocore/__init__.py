@@ -6,9 +6,11 @@ For Claude Code and Codex, run ``neocore setup``. To give any other assistant a 
 
     memory = Memory("memory.db")
     memory.add(conversation="chat-1", user="I moved to Lisbon in May.", assistant="Noted!")
-    print(memory.recall("Where do I live now?").rendered)
+    print(memory.recall("When did I move to Lisbon?").rendered)
 
-Recall makes no model calls. Facts (``form_facts``) are optional and use any model you pass.
+Recall makes no model calls. With the embedder installed (``pip install neocore-memory[embed]``
+and ``neocore setup``) it also finds paraphrases ("Where do I live now?"); without it, recall
+matches words (BM25). Facts (``form_facts``) are optional and use any model you pass.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+import os
 
 __version__ = "0.1.0"
 
@@ -25,13 +28,33 @@ from neocore.store import Store  # noqa: E402
 __all__ = ["GovernedRecall", "Memory", "RecallResult", "Store", "__version__"]
 
 
+def default_embedder_dir() -> Path | None:
+    """The embedder ``neocore setup`` downloads, when it and the ``embed`` extra are present."""
+    home = Path(os.environ.get("NEOCORE_HOME") or Path.home() / ".neocore")
+    folder = home / "models" / "bge-small-en-v1.5-onnx-Q"
+    if not (folder / "model_optimized.onnx").exists():
+        return None
+    try:
+        import numpy  # noqa: F401
+        import onnxruntime  # noqa: F401
+        import tokenizers  # noqa: F401
+    except ImportError:
+        return None
+    return folder
+
+
 class Memory:
     """A store plus recall, for any assistant. Everything lives in one SQLite file."""
 
-    def __init__(self, path: str | Path = ":memory:", *, embedder_dir: str | Path | None = None,
-                 threads: int = 2, **recall_options: Any) -> None:
+    def __init__(self, path: str | Path = ":memory:", *,
+                 embedder_dir: str | Path | None = "auto", threads: int = 2,
+                 **recall_options: Any) -> None:
+        """``embedder_dir="auto"`` uses the embedder ``neocore setup`` downloaded, if any; pass
+        a folder to choose one, or ``None`` for word matching only."""
         self.store = Store(path)
         embedder = None
+        if embedder_dir == "auto":
+            embedder_dir = default_embedder_dir()
         if embedder_dir:
             from neocore.embedder import LocalEmbedder
 

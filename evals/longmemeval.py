@@ -121,7 +121,7 @@ def facts() -> dict[str, list[str]]:
 
 
 def build(item: dict[str, Any], embedder: Any) -> Memory:
-    memory = Memory(":memory:")
+    memory = Memory(":memory:", embedder_dir=None)
     if embedder is not None:
         memory.engine.embedder = memory.engine.query_embedder = embedder
         memory.engine.embedding_model = embedder.model_id

@@ -90,7 +90,7 @@ neocore forget claude-code:<session-id>   # erase a conversation for good (audit
 ```python
 from neocore import Memory
 
-memory = Memory("memory.db", embedder_dir="~/.neocore/models/bge-small-en-v1.5-onnx-Q")
+memory = Memory("memory.db")   # uses the embedder `neocore setup` downloaded, if present
 
 memory.add(conversation="chat-1", user="I moved to Lisbon in May for the Feedzai job.",
            assistant="Congratulations on the move!", at="2026-05-03T10:00:00Z")

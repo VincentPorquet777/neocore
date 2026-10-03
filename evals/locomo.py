@@ -107,7 +107,7 @@ def questions(sample: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def build(sample: dict[str, Any], embedder: Any, facts: bool) -> Memory:
-    memory = Memory(":memory:")
+    memory = Memory(":memory:", embedder_dir=None)
     if embedder is not None:
         memory.engine.embedder = memory.engine.query_embedder = embedder
         memory.engine.embedding_model = embedder.model_id
