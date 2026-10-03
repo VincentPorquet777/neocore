@@ -15,10 +15,10 @@ matches words (BM25). Facts (``form_facts``) are optional and use any model you 
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
-import os
 
 __version__ = "0.1.0"
 
