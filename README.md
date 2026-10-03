@@ -1,5 +1,9 @@
 # NeoCore
 
+[![test](https://github.com/VincentPorquet777/neocore/actions/workflows/test.yml/badge.svg)](https://github.com/VincentPorquet777/neocore/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+
 **Long-term memory for AI assistants that recalls only what the moment needs, and never what it
 shouldn't.**
 
