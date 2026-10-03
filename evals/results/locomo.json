@@ -1,0 +1,37 @@
+{
+ "benchmark": "LoCoMo (10 conversations, categories 1-4)",
+ "n": 1540,
+ "accuracy": 0.8753,
+ "by_category": {
+  "multi-hop": {
+   "n": 282,
+   "accuracy": 0.8227
+  },
+  "open-domain": {
+   "n": 96,
+   "accuracy": 0.6354
+  },
+  "single-hop": {
+   "n": 841,
+   "accuracy": 0.918
+  },
+  "temporal": {
+   "n": 321,
+   "accuracy": 0.8816
+  }
+ },
+ "reader": "openai/gpt-4.1-mini",
+ "judge": "openai/gpt-4o-mini",
+ "recall": {
+  "top_spans": 24,
+  "window": 1,
+  "budget_bytes": 24000,
+  "top_facts": 60,
+  "facts_share": 0.3
+ },
+ "recall_model_calls": 0,
+ "recall_p50_ms": 21.7,
+ "recall_p95_ms": 36.9,
+ "mean_context_bytes": 14592,
+ "usd": 2.418
+}

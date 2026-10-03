@@ -1,0 +1,49 @@
+{
+ "benchmark": "LongMemEval-S (500 questions)",
+ "n": 500,
+ "accuracy": 0.896,
+ "by_type": {
+  "abstention": {
+   "n": 30,
+   "accuracy": 0.8667
+  },
+  "knowledge-update": {
+   "n": 78,
+   "accuracy": 0.9231
+  },
+  "multi-session": {
+   "n": 133,
+   "accuracy": 0.8195
+  },
+  "single-session-assistant": {
+   "n": 56,
+   "accuracy": 0.875
+  },
+  "single-session-preference": {
+   "n": 30,
+   "accuracy": 0.9
+  },
+  "single-session-user": {
+   "n": 70,
+   "accuracy": 0.9857
+  },
+  "temporal-reasoning": {
+   "n": 133,
+   "accuracy": 0.9173
+  }
+ },
+ "reader": "openai/gpt-4.1-mini",
+ "judge": "openai/gpt-4o-2024-08-06",
+ "recall": {
+  "top_spans": 50,
+  "window": 0,
+  "budget_bytes": 28000,
+  "top_facts": 60,
+  "facts_share": 0.3
+ },
+ "recall_model_calls": 0,
+ "recall_p50_ms": 20.3,
+ "recall_p95_ms": 24.8,
+ "mean_context_bytes": 15834,
+ "usd": 1.515
+}

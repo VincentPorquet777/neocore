@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neocore-memory"
+version = "0.1.0"
+description = "Governed long-term memory for AI assistants: recalls only what the moment needs. Shared memory for Claude Code and Codex."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Vincent Porquet" }]
+keywords = ["memory", "llm", "agents", "claude-code", "codex", "rag", "long-term-memory"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Dense recall (bge-small on CPU) and sleep. Without them recall is lexical (BM25) only.
+embed = ["numpy>=1.24", "onnxruntime>=1.17", "tokenizers>=0.15"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+neocore = "neocore.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/VincentPorquet777/neocore"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neocore"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

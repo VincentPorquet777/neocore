@@ -1,0 +1,30 @@
+{
+ "benchmark": "Governance (LoCoMo conversations as governed memory)",
+ "questions": 1540,
+ "delivered_excerpts": 87863,
+ "leaks": {
+  "aud-b": 0,
+  "revoked": 0,
+  "stale": 0,
+  "abandoned": 0
+ },
+ "questions_with_leak": 0,
+ "gold_permitted": 816,
+ "gold_reached": 810,
+ "leak_rate": 0.0,
+ "permitted_gold_session_reached": 0.9926,
+ "recall_p50_ms": 13.6,
+ "recall_p95_ms": 1259.5,
+ "model_calls": 0,
+ "dense": true,
+ "ungoverned_control": {
+  "leaks": {
+   "aud-b": 4762,
+   "revoked": 2419,
+   "stale": 2413,
+   "abandoned": 2487
+  },
+  "questions_with_leak": 1540,
+  "leak_rate": 1.0
+ }
+}
