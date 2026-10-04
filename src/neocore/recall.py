@@ -32,6 +32,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from neocore.temporal import annotate
@@ -211,8 +212,12 @@ class GovernedRecall:
         refresh_on_recall: bool = True,
         turn_weight: float = 0.0,
         recency_weight: float = 0.0,
+        consolidation: str | Path | None = None,
     ) -> None:
         self.store = store
+        # Newest wins: sleep's verdicts file (see ``neocore.consolidation``); None shows every
+        # fact as formed.
+        self.consolidation = Path(consolidation) if consolidation else None
         # A line rarely names its own topic ("Atlas is healthy on b117"); the turn around it
         # does. ``turn_weight`` votes for the best line of each lexically best-matching turn.
         self.turn_weight = turn_weight
@@ -609,7 +614,8 @@ class GovernedRecall:
                 for s in delivered_spans
             ],
             "delivered_facts": [
-                {"fact_id": f["fact_id"], "source_evidence_ids": f["sources"]}
+                {"fact_id": f["fact_id"], "source_evidence_ids": f["sources"],
+                 **({"replaced_by": f["newer"]} if f.get("newer") else {})}
                 for f in delivered_facts
             ],
             "rendered_bytes": len(rendered.encode()),
@@ -665,20 +671,48 @@ class GovernedRecall:
         chosen = _fuse(rankings, limit)
         if not chosen:
             return []
-        rows = {
-            str(r["fact_id"]): r
-            for r in self.store.rows(
-                "SELECT fact_id,occurred_at,text FROM recall_facts WHERE fact_id IN "
-                f"({','.join('?' for _ in chosen)})",  # noqa: S608
-                tuple(chosen),
-            )
-        }
-        return [
-            {"fact_id": f, "occurred_at": str(rows[f]["occurred_at"]), "text": str(rows[f]["text"]),
-             "sources": sorted(sources[f])}
-            for f in chosen
-            if f in rows
-        ]
+
+        def fetch(ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+            ids = [f for f in ids if f in allowed]
+            if not ids:
+                return {}
+            return {
+                str(r["fact_id"]): {"fact_id": str(r["fact_id"]),
+                                    "occurred_at": str(r["occurred_at"]), "text": str(r["text"]),
+                                    "sources": sorted(sources[str(r["fact_id"])])}
+                for r in self.store.rows(
+                    "SELECT fact_id,occurred_at,text FROM recall_facts WHERE fact_id IN "
+                    f"({','.join('?' for _ in ids)})",  # noqa: S608
+                    tuple(ids),
+                )
+            }
+
+        found = fetch(chosen)
+        ranked = [found[f] for f in chosen if f in found]
+        if self.consolidation is None:
+            return ranked
+        from neocore import consolidation
+
+        by, duplicates = consolidation.verdicts(self.consolidation)
+        return consolidation.cap(
+            consolidation.apply(ranked, by, duplicates, lambda ids: fetch(sorted(ids))), limit)
+
+    def consolidate(self, judge: Callable[[str, dict[str, Any]], dict[str, Any]], *,
+                    max_calls: int = 1, tau: float | None = None) -> dict[str, int]:
+        """Sleep: judge up to ``max_calls`` topic groups of facts not yet seen and record the
+        verdicts recall applies. Does nothing unless ``consolidation`` names a verdicts file."""
+        if self.consolidation is None:
+            return {"calls": 0, "judged": 0, "retired": 0, "failed": 0, "waiting": 0}
+        from neocore import consolidation
+
+        # Only facts recall could show someone now take part: every scope, latest revision,
+        # current branch, not revoked.
+        scopes = {str(r["sensitivity"]) for r in self.store.rows(
+            "SELECT DISTINCT sensitivity FROM evidence")}
+        active = self._permitted_evidence(scopes, set()) if scopes else set()
+        return consolidation.consolidate(
+            self.store.rows, self.consolidation, judge, active=active, max_calls=max_calls,
+            tau=consolidation.TAU if tau is None else tau, model=self.embedding_model)
 
     def _nearest(
         self, cache: _VectorCache, query_vector: Any, allowed: set[str], limit: int
@@ -910,6 +944,34 @@ def _line(span: RecalledSpan) -> str:
     return ("User: " if span.speaker == "User" else "Assistant: ") + span.text
 
 
+_REPLACED_NOTE = (
+    "Facts marked (replaced) are history: a newer fact beside them says what holds now.\n"
+)
+
+
+def _fact_line(fact: dict[str, Any]) -> str:
+    mark = "(replaced) " if fact.get("newer") else ""
+    return f"- [{_day(fact['occurred_at'])}] {mark}{fact['text']}\n"
+
+
+def _in_time_order(lines: list[tuple[str, str]], facts: list[dict[str, Any]]) -> list[str]:
+    """Fact lines oldest first, except that a replaced fact sits directly above its
+    replacement (``lines[i]`` renders ``facts[i]``)."""
+    rows = list(zip(lines, facts, strict=True))
+    position = {fact["fact_id"]: n for n, (_, fact) in enumerate(rows)}
+    above: dict[int, list[int]] = {}
+    for n, (_, fact) in enumerate(rows):
+        if fact.get("newer") in position:
+            above.setdefault(position[fact["newer"]], []).append(n)
+    placed = {n for ns in above.values() for n in ns}
+    out: list[str] = []
+    for n in sorted((n for n in range(len(rows)) if n not in placed),
+                    key=lambda n: rows[n][0][0]):
+        out += [rows[m][0][1] for m in sorted(above.get(n, []), key=lambda m: rows[m][0][0])]
+        out.append(rows[n][0][1])
+    return out
+
+
 def _render(
     spans: list[RecalledSpan],
     budget: int,
@@ -935,22 +997,38 @@ def _render(
     if facts:
         # Facts spend a capped share in relevance order, then read chronologically.
         heading = "Formed from earlier conversations (dated, derived from the excerpts' sources):\n"
-        cap = used + len(heading.encode()) + int(budget * facts_share)
-        lines: list[tuple[str, str]] = []
-        spent = used + len(heading.encode())
+        # A replaced fact and the fact that replaced it are spent together, or not at all.
+        units: list[list[dict[str, Any]]] = []
         for fact in facts:
-            line = f"- [{_day(fact['occurred_at'])}] {fact['text']}\n"
-            if spent + len(line.encode()) > min(cap, budget):
+            if units and len(units[-1]) == 1 and units[-1][0].get("newer") == fact["fact_id"]:
+                units[-1].append(fact)
+            else:
+                units.append([fact])
+        note = _REPLACED_NOTE if any(f.get("newer") for f in facts) else ""
+        cap = used + len(heading.encode()) + len(note.encode()) + int(budget * facts_share)
+        lines: list[tuple[str, str]] = []
+        spent = used + len(heading.encode()) + len(note.encode())
+        given: set[str] = set()
+        for unit in units:
+            if unit[-1].get("newer") and unit[-1]["newer"] not in given:
+                continue  # its replacement ranked higher but did not fit
+            unit_lines = [(f["occurred_at"], _fact_line(f)) for f in unit]
+            cost = sum(len(line.encode()) for _, line in unit_lines)
+            if spent + cost > min(cap, budget):
                 continue
-            spent += len(line.encode())
-            lines.append((fact["occurred_at"], line))
-            delivered_facts.append(fact)
+            spent += cost
+            lines += unit_lines
+            delivered_facts += unit
+            given.update(f["fact_id"] for f in unit)
+        if note and not any(f.get("newer") for f in delivered_facts):
+            spent -= len(note.encode())
+            note = ""
         if lines:
-            parts.append(heading)
-            parts.extend(line for _, line in sorted(lines, key=lambda pair: pair[0]))
+            parts.append(heading + note)
+            parts.extend(_in_time_order(lines, delivered_facts))
             used = spent
     delivered: list[RecalledSpan] = []
-    if spans:
+    if spans and used + len("Excerpts:\n") <= budget:
         parts.append("Excerpts:\n")
         used += len(parts[-1])
         # Budget is spent in relevance order (``spans`` arrive ranked, neighbours beside their

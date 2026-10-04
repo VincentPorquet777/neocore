@@ -145,6 +145,24 @@ Any text missing from the file is embedded locally, so the results are the same 
 Every model call is cached in `runs/<name>/cache.jsonl`. Rerunning a phase is free, and an
 interrupted run resumes where it stopped.
 
+## Sleep (newest wins), optional
+
+`Memory(..., consolidation="sleep.json")` plus `memory.sleep(ask)` lets a model mark facts that a
+newer fact replaced. Recall then shows the old fact as `(replaced)` directly above the new one.
+It is off by default, and the figures above were measured without it.
+
+| Check | Without sleep | With sleep |
+|---|---|---|
+| LongMemEval-S knowledge-update (78 q, gpt-4o judge) | 92.3% | **93.6%** |
+| LoCoMo, zero-call: every gold session reached (1,536 q) | 98.44% | 98.50% |
+| LoCoMo, zero-call: fact sources in a gold session | 99.41% | 99.28% |
+| LoCoMo, mean context bytes | 14,587 | 14,797 |
+
+The sleep verdicts came from gpt-4.1-mini (tau 0.75). To reproduce, run
+`longmemeval.py sleep --run runs/lme-sleep --sleep runs/lme-sleep/verdicts --type knowledge-update
+--tau 0.75 --judge openai/gpt-4.1-mini --model-dir <bge-small>`, then `answer` with the same
+`--sleep` folder, then `judge` and `report`. `locomo.py` takes the same options.
+
 ## Honest notes
 
 - **Tuned on these benchmarks.** The recall settings were tuned on a stratified pilot of

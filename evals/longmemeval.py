@@ -12,6 +12,10 @@ gpt-4o with the official LongMemEval judge prompts.
     longmemeval.py answer --run RUN [--vectors V.npz] [--limit N]
     longmemeval.py judge  --run RUN
     longmemeval.py report --run RUN
+
+Newest wins (optional): ``sleep --run RUN --sleep DIR`` forms sleep verdicts for each
+question's haystack with ``--judge`` (your Codex sign-in, or an OpenRouter model), and
+``answer --sleep DIR`` recalls with them. ``--type knowledge-update`` limits any phase to one question type.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DATA, Embedder, Recorder, chat, spent  # noqa: E402
+from common import DATA, Embedder, Recorder, chat, sleep_judge, spent  # noqa: E402
 
 from neocore import Memory  # noqa: E402
 
@@ -96,8 +100,10 @@ def session_key(date: str, session: list[dict[str, Any]]) -> str:
     return hashlib.sha1((date + "\n" + user).encode()).hexdigest()
 
 
-def items(limit: int = 0) -> list[dict[str, Any]]:
+def items(limit: int = 0, kind: str = "") -> list[dict[str, Any]]:
     data = json.loads((DATA / "longmemeval_s_cleaned.json").read_text(encoding="utf-8"))
+    if kind:
+        data = [item for item in data if item["question_type"] == kind]
     if not limit:
         return data
     per: collections.Counter[str] = collections.Counter()
@@ -170,12 +176,43 @@ def texts(args: argparse.Namespace) -> None:
     print(f"{len(recorder.texts)} texts")
 
 
+def sleep(args: argparse.Namespace) -> None:
+    """Sleep verdicts for every haystack, until no topic group is left to judge. Verdicts are
+    kept per question in ``--sleep DIR``, so an interrupted pass resumes where it stopped."""
+    from neocore import consolidation
+
+    if not args.sleep or not args.model_dir:
+        raise SystemExit("sleep needs --sleep DIR and --model-dir (facts are grouped by vector)")
+    ask = sleep_judge(args.run, args.judge, args.effort)
+    embedder = Embedder(args.model_dir, args.vectors)
+    args.sleep.mkdir(parents=True, exist_ok=True)
+
+    def one(item: dict[str, Any]) -> dict[str, Any]:
+        memory = build(item, embedder)
+        path = args.sleep / f"{item['question_id']}.json"
+        total = {"calls": 0, "failed": 0}
+        while True:
+            counts = consolidation.consolidate(memory.store.rows, path, ask, max_calls=4,
+                                                tau=args.tau)
+            total["calls"] += counts["calls"]
+            total["failed"] += counts["failed"]
+            if not counts["calls"] or counts["failed"] == counts["calls"]:
+                break
+        return {"question_id": item["question_id"], **total,
+                "retired": len(consolidation.verdicts(path)[0])}
+
+    todo = items(args.limit, args.type)
+    with ThreadPoolExecutor(args.workers) as pool:
+        for count, row in enumerate(pool.map(one, todo), 1):
+            print(json.dumps({"done": count, "of": len(todo), **row}), flush=True)
+
+
 def answer(args: argparse.Namespace) -> None:
     embedder = Embedder(args.model_dir, args.vectors) if args.model_dir else None
     path = args.run / "answers.jsonl"
     done = ({json.loads(x)["question_id"] for x in path.read_text().splitlines()}
             if path.exists() else set())
-    todo = [i for i in items(args.limit) if i["question_id"] not in done]
+    todo = [i for i in items(args.limit, args.type) if i["question_id"] not in done]
 
     def read(prepared: tuple[dict[str, Any], str, float, int]) -> dict[str, Any]:
         item, context, seconds, calls = prepared
@@ -191,6 +228,8 @@ def answer(args: argparse.Namespace) -> None:
             batch = []
             for item in todo[start:start + 12]:
                 memory = build(item, embedder)
+                if args.sleep:
+                    memory.engine.consolidation = args.sleep / f"{item['question_id']}.json"
                 began = time.perf_counter()
                 result = memory.recall(item["question"], **RECALL)
                 batch.append((item, result.rendered, time.perf_counter() - began,
@@ -248,14 +287,20 @@ def report(args: argparse.Namespace) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("texts", "answer", "judge", "report"))
+    parser.add_argument("phase", choices=("texts", "sleep", "answer", "judge", "report"))
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=0, help="first N questions of each type")
+    parser.add_argument("--type", default="", help="only this question type")
+    parser.add_argument("--sleep", type=Path, help="folder of sleep verdicts (newest wins)")
+    parser.add_argument("--effort", default="low", help="Codex reasoning effort for sleep")
+    parser.add_argument("--judge", default="codex", help="sleep model: codex or an OpenRouter id")
+    parser.add_argument("--tau", type=float, default=0.80, help="sleep topic similarity")
+    parser.add_argument("--workers", type=int, default=4, help="parallel Codex calls for sleep")
     parser.add_argument("--model-dir", default="", help="bge-small ONNX folder (dense recall)")
     parser.add_argument("--vectors", type=Path, help="precomputed vectors for the texts")
     args = parser.parse_args()
     args.run.mkdir(parents=True, exist_ok=True)
-    {"texts": texts, "answer": answer, "judge": judge, "report": report}[args.phase](args)
+    {"texts": texts, "sleep": sleep, "answer": answer, "judge": judge, "report": report}[args.phase](args)
     return 0
 
 

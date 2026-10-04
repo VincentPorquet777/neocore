@@ -129,3 +129,22 @@ class Recorder:
     def __call__(self, texts: Sequence[str]) -> list[list[float]]:
         self.texts.update(texts)
         return [[0.0] * 4 for _ in texts]
+
+
+def sleep_judge(run: Path, judge: str, effort: str = "low") -> Any:
+    """The model sleep asks: ``codex`` (your own sign-in, via ``neocore.llm``) or an OpenRouter
+    model id, called through ``chat`` so answers are cached and counted like reader calls."""
+    from neocore import llm
+
+    if judge == "codex":
+        executable = llm.find_codex()
+        if not executable:
+            raise SystemExit("sleep needs the Codex CLI (or --judge <openrouter model>)")
+        return llm.codex(executable, effort=effort)
+
+    def ask(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        text = chat(run, judge, f"{prompt}\n\nReply with one JSON object matching this JSON "
+                    f"Schema:\n{json.dumps(schema)}", max_tokens=4000, purpose="sleep")
+        return llm._json_in(text)
+
+    return ask

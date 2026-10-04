@@ -91,6 +91,16 @@ class Memory:
         return self.engine.form_facts(_fact_extractor(ask), former="memory",
                                       max_batches=max_batches, roles=roles)
 
+    def sleep(self, ask: Callable[[str, dict[str, Any]], dict[str, Any]], *,
+              max_calls: int = 8) -> dict[str, int]:
+        """Newest wins: judge groups of related facts with ``ask`` so recall shows a replaced
+        fact only beside what replaced it. Needs ``Memory(..., consolidation="sleep.json")``
+        and the embedder (facts are grouped by meaning)."""
+        if self.engine.consolidation is None:
+            raise ValueError("pass consolidation=<verdicts file> to Memory to use sleep")
+        self.engine.backfill(None)
+        return self.engine.consolidate(ask, max_calls=max_calls)
+
     def revoke(self, evidence_id: str, *, reason: str) -> None:
         self.store.revoke(evidence_id, reason=reason)
 

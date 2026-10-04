@@ -11,6 +11,10 @@ added citing their session. Every question is answered by the same reader from w
     locomo.py answer --run RUN [--vectors V.npz] [--convs conv-26,...] [--no-facts]
     locomo.py judge  --run RUN
     locomo.py report --run RUN
+
+Newest wins (optional): ``sleep --run RUN --sleep DIR`` forms sleep verdicts for each
+conversation with ``--judge`` (your Codex sign-in, or an OpenRouter model), and
+``answer --sleep DIR`` recalls with them.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DATA, Embedder, Recorder, chat, spent  # noqa: E402
+from common import DATA, Embedder, Recorder, chat, sleep_judge, spent  # noqa: E402
 
 from neocore import Memory  # noqa: E402
 
@@ -140,6 +144,36 @@ def texts(args: argparse.Namespace) -> None:
     print(f"{len(recorder.texts)} texts -> {path}")
 
 
+def sleep(args: argparse.Namespace) -> None:
+    """Sleep verdicts for every conversation, until no topic group is left to judge. Verdicts
+    are kept per conversation in ``--sleep DIR``, so an interrupted pass resumes."""
+    from neocore import consolidation
+
+    if not args.sleep or not args.model_dir:
+        raise SystemExit("sleep needs --sleep DIR and --model-dir (facts are grouped by vector)")
+    ask = sleep_judge(args.run, args.judge, args.effort)
+    embedder = Embedder(args.model_dir, args.vectors)
+    args.sleep.mkdir(parents=True, exist_ok=True)
+
+    def one(sample: dict[str, Any]) -> dict[str, Any]:
+        memory = build(sample, embedder, facts=True)
+        path = args.sleep / f"{sample['sample_id']}.json"
+        total = {"calls": 0, "failed": 0}
+        while True:
+            counts = consolidation.consolidate(memory.store.rows, path, ask, max_calls=4,
+                                               tau=args.tau)
+            total["calls"] += counts["calls"]
+            total["failed"] += counts["failed"]
+            if not counts["calls"] or counts["failed"] == counts["calls"]:
+                break
+        return {"conv": sample["sample_id"], **total,
+                "retired": len(consolidation.verdicts(path)[0])}
+
+    with ThreadPoolExecutor(args.workers) as pool:
+        for row in pool.map(one, samples(args.convs)):
+            print(json.dumps(row), flush=True)
+
+
 def answer(args: argparse.Namespace) -> None:
     embedder = Embedder(args.model_dir, args.vectors) if args.model_dir else None
     path = args.run / "answers.jsonl"
@@ -149,6 +183,8 @@ def answer(args: argparse.Namespace) -> None:
         if not rows:
             continue
         memory = build(sample, embedder, facts=not args.no_facts)
+        if args.sleep:
+            memory.engine.consolidation = args.sleep / f"{sample['sample_id']}.json"
         conv = sample["conversation"]
 
         prepared = []
@@ -217,15 +253,20 @@ def report(args: argparse.Namespace) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("texts", "answer", "judge", "report"))
+    parser.add_argument("phase", choices=("texts", "sleep", "answer", "judge", "report"))
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--convs", default="")
     parser.add_argument("--model-dir", default="", help="bge-small ONNX folder (dense recall)")
     parser.add_argument("--vectors", type=Path, help="precomputed vectors for the texts")
     parser.add_argument("--no-facts", action="store_true")
+    parser.add_argument("--sleep", type=Path, help="folder of sleep verdicts (newest wins)")
+    parser.add_argument("--tau", type=float, default=0.80, help="sleep topic similarity")
+    parser.add_argument("--effort", default="low", help="Codex reasoning effort for sleep")
+    parser.add_argument("--judge", default="codex", help="sleep model: codex or an OpenRouter id")
+    parser.add_argument("--workers", type=int, default=4, help="parallel Codex calls for sleep")
     args = parser.parse_args()
     args.run.mkdir(parents=True, exist_ok=True)
-    {"texts": texts, "answer": answer, "judge": judge, "report": report}[args.phase](args)
+    {"texts": texts, "sleep": sleep, "answer": answer, "judge": judge, "report": report}[args.phase](args)
     return 0
 
 
