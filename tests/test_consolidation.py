@@ -127,6 +127,11 @@ def test_chains_follow_only_facts_recall_may_show(tmp_path: Path) -> None:
     shown = {f"c{n}" for n in range(10)}
     # Every replaced fact points at a fact that is not itself replaced.
     assert _offer(["c8", "c0"], line, shown) == [("c8", "c9"), ("c9", ""), ("c0", "c9")]
+    long = {f"v{n}": f"v{n + 1}" for n in range(12)}  # longer than the old 8-level fetch
+    assert _offer(["v0"], long, set(long) | {"v12"}) == [("v0", "v12"), ("v12", "")]
+    endless = {f"e{n}": f"e{n + 1}" for n in range(consolidation.CHAIN + 5)}
+    # Past what one recall fetches, the fact is shown as it always was, never beside a stale one.
+    assert _offer(["e0"], endless, set(endless) | {f"e{consolidation.CHAIN + 5}"}) == [("e0", "")]
     # A duplicate is never swapped for a twin recall may not show.
     assert _offer(["d"], {"d": "k"}, set(), frozenset({"d"})) == [("d", "")]
 

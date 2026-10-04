@@ -75,7 +75,7 @@ SCHEMA: dict[str, Any] = {
 
 Judge = Callable[[str, dict[str, Any]], dict[str, Any]]
 Rows = Callable[..., Any]
-CHAIN = 8  # replacement levels fetched per recall (v1 -> v2 -> ... -> newest)
+CHAIN = 32  # replacement levels fetched per recall (v1 -> v2 -> ... -> newest)
 SCAN = 256  # facts examined for a topic group per allowed call, so one turn's work is bounded
 _cache: dict[str, tuple[float, dict[str, str], frozenset[str]]] = {}
 
@@ -109,7 +109,8 @@ def apply(ranked: list[dict[str, Any]], by: dict[str, str], duplicates: Iterable
     its kept twin, and a retired fact marked ``newer`` and followed by its newest replacement.
     ``fetch(ids)`` returns the facts recall may show among ``ids``. A chain is followed only
     through facts recall may show: one it may not show ends the chain there, and if it is the
-    first step, the fact is offered exactly as it was. A cycle replaces nothing."""
+    first step, the fact is offered exactly as it was. A cycle, or a chain longer than ``CHAIN``,
+    replaces nothing."""
     duplicates = set(duplicates)
     if not by:
         return ranked
@@ -135,6 +136,8 @@ def apply(ranked: list[dict[str, Any]], by: dict[str, str], duplicates: Iterable
         current = fact_id
         while by.get(current) in known:  # stops at the first fact recall may not show
             current = by[current]
+        if by.get(current) is not None and by[current] not in asked:
+            return None  # a chain longer than one recall fetches: shown as it always was
         return current if current != fact_id else None
 
     out: list[dict[str, Any]] = []
