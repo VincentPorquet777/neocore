@@ -956,19 +956,34 @@ def _fact_line(fact: dict[str, Any]) -> str:
 
 def _in_time_order(lines: list[tuple[str, str]], facts: list[dict[str, Any]]) -> list[str]:
     """Fact lines oldest first, except that a replaced fact sits directly above its
-    replacement (``lines[i]`` renders ``facts[i]``)."""
+    replacement (``lines[i]`` renders ``facts[i]``). Every line is printed exactly once."""
     rows = list(zip(lines, facts, strict=True))
     position = {fact["fact_id"]: n for n, (_, fact) in enumerate(rows)}
     above: dict[int, list[int]] = {}
     for n, (_, fact) in enumerate(rows):
-        if fact.get("newer") in position:
-            above.setdefault(position[fact["newer"]], []).append(n)
+        target = position.get(fact.get("newer") or "")
+        if target is not None and target != n:
+            above.setdefault(target, []).append(n)
     placed = {n for ns in above.values() for n in ns}
+
+    def day(n: int) -> str:
+        return rows[n][0][0]
+
     out: list[str] = []
-    for n in sorted((n for n in range(len(rows)) if n not in placed),
-                    key=lambda n: rows[n][0][0]):
-        out += [rows[m][0][1] for m in sorted(above.get(n, []), key=lambda m: rows[m][0][0])]
+    done: set[int] = set()
+
+    def emit(n: int) -> None:
+        if n in done:
+            return
+        done.add(n)
+        for m in sorted(above.get(n, []), key=day):  # what it replaced, oldest first, above it
+            emit(m)
         out.append(rows[n][0][1])
+
+    for n in sorted((n for n in range(len(rows)) if n not in placed), key=day):
+        emit(n)
+    for n in sorted(range(len(rows)), key=day):  # links that loop are still printed once
+        emit(n)
     return out
 
 

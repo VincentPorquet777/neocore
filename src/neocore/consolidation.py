@@ -27,7 +27,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 TAU = 0.80  # cosine (bge-small) at which two facts are about the same topic
 NEIGHBOURS = 23  # a group is a new fact and at most this many facts on its topic
@@ -75,8 +75,8 @@ SCHEMA: dict[str, Any] = {
 
 Judge = Callable[[str, dict[str, Any]], dict[str, Any]]
 Rows = Callable[..., Any]
-CHAIN = 8  # replacements followed per fact (v1 -> v2 -> ... -> newest)
-LOCK_STALE = 900  # seconds after which a sleep lock left by a dead worker is taken over
+CHAIN = 8  # replacement levels fetched per recall (v1 -> v2 -> ... -> newest)
+SCAN = 256  # facts examined for a topic group per allowed call, so one turn's work is bounded
 _cache: dict[str, tuple[float, dict[str, str], frozenset[str]]] = {}
 
 
@@ -126,15 +126,15 @@ def apply(ranked: list[dict[str, Any]], by: dict[str, str], duplicates: Iterable
             break
 
     def newest(fact_id: str) -> str | None:
-        seen, current = {fact_id}, fact_id
-        for _ in range(CHAIN):
-            step = by.get(current)
-            if step is None or step not in known:
-                break
+        seen, step = {fact_id}, by.get(fact_id)
+        while step is not None:
             if step in seen:
-                return None  # a cycle: no fact in it is newer than the others
+                return None  # a cycle ahead: no fact in it is newer than the others
             seen.add(step)
-            current = step
+            step = by.get(step)
+        current = fact_id
+        while by.get(current) in known:  # stops at the first fact recall may not show
+            current = by[current]
         return current if current != fact_id else None
 
     out: list[dict[str, Any]] = []
@@ -213,19 +213,39 @@ def _write(path: Path, state: dict[str, Any]) -> None:
         raise
 
 
-def _lock(path: Path) -> Path | None:
-    """One sleeper per verdicts file: a second worker skips this turn rather than wait."""
-    lock = path.with_name(f"{path.name}.lock")
+def _lock(path: Path) -> IO[bytes] | None:
+    """One sleeper per verdicts file: a second worker skips this turn rather than wait. The
+    operating system drops the lock when its holder exits, so a crashed worker blocks nobody."""
+    lock = open(path.with_name(f"{path.name}.lock"), "a+b")  # noqa: SIM115
     try:
-        if time.time() - lock.stat().st_mtime > LOCK_STALE:
-            lock.unlink(missing_ok=True)
+        lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        pass
-    try:
-        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except OSError:
+        lock.close()
         return None
     return lock
+
+
+def _unlock(lock: IO[bytes]) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock.close()
 
 
 def _facts(rows: Rows, prefix: str, active: set[str] | None,
@@ -234,21 +254,27 @@ def _facts(rows: Rows, prefix: str, active: set[str] | None,
 
     scopes: dict[str, set[str]] = {}
     sources: dict[str, list[str]] = {}
+    missing: set[str] = set()
     for row in rows(f"SELECT s.fact_id,s.evidence_id,e.sensitivity "
                     f"FROM {prefix}recall_fact_sources s "
-                    "JOIN evidence e ON e.evidence_id=s.evidence_id"):
-        scopes.setdefault(str(row["fact_id"]), set()).add(str(row["sensitivity"]))
-        sources.setdefault(str(row["fact_id"]), []).append(str(row["evidence_id"]))
+                    "LEFT JOIN evidence e ON e.evidence_id=s.evidence_id"):
+        fact_id = str(row["fact_id"])
+        if row["sensitivity"] is None:
+            missing.add(fact_id)  # a source is gone: the fact takes no part
+        scopes.setdefault(fact_id, set()).add(str(row["sensitivity"]))
+        sources.setdefault(fact_id, []).append(str(row["evidence_id"]))
+    if not model:  # one embedder's vectors only: the one most facts were embedded with
+        top = rows(f"SELECT model,COUNT(*) AS n FROM {prefix}recall_fact_vectors "
+                   "GROUP BY model ORDER BY n DESC,model LIMIT 1")
+        model = str(top[0]["model"]) if top else ""
     facts: list[dict[str, str]] = []
     vectors = []
     select = (f"SELECT f.fact_id,f.occurred_at,f.text,v.vector FROM {prefix}recall_facts f "
               f"JOIN {prefix}recall_fact_vectors v ON v.fact_id=f.fact_id ")
-    found = (rows(select + "WHERE v.model=? ORDER BY f.occurred_at,f.fact_id", (model,))
-             if model else rows(select + "ORDER BY f.occurred_at,f.fact_id"))
     size = 0
-    for row in found:
+    for row in rows(select + "WHERE v.model=? ORDER BY f.occurred_at,f.fact_id", (model,)):
         fact_id = str(row["fact_id"])
-        if fact_id not in scopes:
+        if fact_id not in scopes or fact_id in missing:
             continue  # its sources are gone
         if active is not None and not all(e in active for e in sources[fact_id]):
             continue  # recall may not show it now: it neither replaces nor is replaced
@@ -279,6 +305,8 @@ def consolidate(rows: Rows, path: Path, judge: Judge, *, prefix: str = "",
         import numpy as np
     except ImportError:
         return {**counts, "skipped": 1}
+    if max_calls <= 0:
+        return counts
     lock = _lock(path)
     if lock is None:
         return {**counts, "busy": 1}
@@ -286,7 +314,7 @@ def consolidate(rows: Rows, path: Path, judge: Judge, *, prefix: str = "",
         return _consolidate(np, rows, path, judge, prefix, None if active is None else set(active),
                             max_calls, tau, model, counts)
     finally:
-        lock.unlink(missing_ok=True)
+        _unlock(lock)
 
 
 def _consolidate(np: Any, rows: Rows, path: Path, judge: Judge, prefix: str,
@@ -304,9 +332,13 @@ def _consolidate(np: Any, rows: Rows, path: Path, judge: Judge, prefix: str,
     packs: list[list[list[int]]] = []
     grouped: set[int] = set()
     scope = np.array([f["scope"] for f in facts]) if facts else None
+    examined = 0
     for index, fact in enumerate(facts):
         if fact["id"] in seen or index in grouped:
             continue
+        examined += 1
+        if examined > SCAN * max_calls:
+            break  # the rest waits for a later turn
         similarity = matrix @ matrix[index]
         similarity[scope != fact["scope"]] = -1.0  # never across audiences
         near = np.flatnonzero(similarity >= tau)

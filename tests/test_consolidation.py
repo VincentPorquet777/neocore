@@ -121,6 +121,12 @@ def test_chains_follow_only_facts_recall_may_show(tmp_path: Path) -> None:
     # The end was revoked: the chain stops at the newest fact recall may show.
     assert _offer(["v1"], by, everything - {"v3"}) == [("v1", "v2"), ("v2", "")]
     assert _offer(["x", "y"], by, everything) == [("x", ""), ("y", "")]  # a cycle retires none
+    ring = {f"r{n}": f"r{(n + 1) % 9}" for n in range(9)}  # longer than one recall's fetch
+    assert _offer(["r0"], ring, set(ring)) == [("r0", "")]
+    line = {f"c{n}": f"c{n + 1}" for n in range(9)}  # c0 -> c1 -> ... -> c9
+    shown = {f"c{n}" for n in range(10)}
+    # Every replaced fact points at a fact that is not itself replaced.
+    assert _offer(["c8", "c0"], line, shown) == [("c8", "c9"), ("c9", ""), ("c0", "c9")]
     # A duplicate is never swapped for a twin recall may not show.
     assert _offer(["d"], {"d": "k"}, set(), frozenset({"d"})) == [("d", "")]
 
@@ -262,9 +268,12 @@ def test_sleep_counts_a_failed_call_and_waits_while_another_sleeps(tmp_path: Pat
     assert len(calls) == consolidation.OFFERS and consolidation.verdicts(path) == ({}, frozenset())
 
     other = tmp_path / "w.json"
-    Path(f"{other}.lock").write_text("", encoding="utf-8")
+    held = consolidation._lock(other)
+    assert held is not None
     assert consolidation.consolidate(store.rows, other, broken).get("busy") == 1
+    consolidation._unlock(held)
     assert len(calls) == consolidation.OFFERS
+    assert consolidation.consolidate(store.rows, other, broken, max_calls=0)["calls"] == 0
 
 
 def test_sleep_never_groups_facts_recall_may_not_show(tmp_path: Path) -> None:
@@ -281,6 +290,56 @@ def test_sleep_never_groups_facts_recall_may_not_show(tmp_path: Path) -> None:
 
     consolidation.consolidate(store.rows, tmp_path / "v.json", judge, active=every - hidden)
     assert prompts and all("canoe" not in prompt for prompt in prompts)
+
+
+def test_sleep_skips_facts_with_a_missing_source_and_other_embedders(tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+    store, recall, (kayak, bakery, canoe, mill) = _two_topics(tmp_path)
+    raft = recall.add_fact("Owns a green raft.", [_capture(
+        store, "b3", "Owns a green raft.", "2023-05-05T10:00:00+00:00")], former="test")
+    forge = recall.add_fact("Works at the forge.", [_capture(
+        store, "j3", "Works at the forge.", "2023-06-05T10:00:00+00:00")], former="test")
+    assert raft and forge
+    _vectors(store, {raft: [1, 0.02], forge: [0.02, 1]})
+    with store.connection() as connection:
+        connection.execute("INSERT INTO recall_fact_sources(fact_id,evidence_id) VALUES(?,?)",
+                           (canoe, "gone"))
+        connection.execute("UPDATE recall_fact_vectors SET model='old' WHERE fact_id=?", (mill,))
+    prompts: list[str] = []
+
+    def judge(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"facts": []}
+
+    consolidation.consolidate(store.rows, tmp_path / "v.json", judge)
+    assert prompts and "raft" in prompts[0] and "forge" in prompts[0]
+    assert all("canoe" not in p and "mill" not in p for p in prompts)
+
+
+def test_one_turn_examines_a_bounded_number_of_facts(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    store = Store(tmp_path / "m.db")
+    recall = GovernedRecall(store)
+    evidence = _capture(store, "e", "Many unrelated notes.", "2023-01-05T10:00:00+00:00")
+    count = consolidation.SCAN + 40
+    ids = [recall.add_fact(f"Note {n}.", [evidence], former="test") for n in range(count)]
+    basis = np.eye(count, dtype=np.float32)  # every fact alone on its topic
+    _vectors(store, {f: list(basis[n]) for n, f in enumerate(ids) if f})
+    judge_calls: list[int] = []
+    counts = consolidation.consolidate(store.rows, tmp_path / "v.json",
+                                       lambda p, s: judge_calls.append(1) or {"facts": []})
+    assert counts["calls"] == 0 and counts["waiting"] == 40 and not judge_calls
+
+
+def test_rendering_prints_every_delivered_fact_once() -> None:
+    from neocore.recall import _in_time_order
+
+    facts = [{"fact_id": "a", "newer": "b"}, {"fact_id": "b", "newer": "c"}, {"fact_id": "c"},
+             {"fact_id": "x", "newer": "y"}, {"fact_id": "y", "newer": "x"}]
+    lines = [(f"2023-0{n + 1}", f["fact_id"]) for n, f in enumerate(facts)]
+    out = _in_time_order(lines, facts)
+    assert sorted(out) == ["a", "b", "c", "x", "y"]
+    assert out.index("a") < out.index("b") < out.index("c")
 
 
 def test_sleep_rejects_a_verdict_naming_an_older_or_foreign_fact() -> None:
