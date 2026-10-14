@@ -8,7 +8,7 @@
 # twice. NEOCORE_PACKAGE picks what to install (a wheel file, for instance).
 $ErrorActionPreference = 'Stop'
 
-$Package = if ($env:NEOCORE_PACKAGE) { $env:NEOCORE_PACKAGE } else { 'neocore-memory[embed]' }
+$Package = if ($env:NEOCORE_PACKAGE) { $env:NEOCORE_PACKAGE } else { 'neocore-memory[embed] @ git+https://github.com/VincentPorquet777/neocore' }
 $Venv = if ($env:NEOCORE_VENV) { $env:NEOCORE_VENV } else { Join-Path $HOME '.neocore\venv' }
 $Python = Join-Path $Venv 'Scripts\python.exe'
 

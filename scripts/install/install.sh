@@ -10,7 +10,7 @@
 # NEOCORE_PACKAGE picks what to install (a wheel file, for instance); NEOCORE_PYTHON the Python.
 set -eu
 
-PACKAGE="${NEOCORE_PACKAGE:-neocore-memory[embed]}"
+PACKAGE="${NEOCORE_PACKAGE:-neocore-memory[embed] @ git+https://github.com/VincentPorquet777/neocore}"
 VENV="${NEOCORE_VENV:-$HOME/.neocore/venv}"
 
 fail() { printf 'neocore install: %s\n' "$1" >&2; exit 1; }
