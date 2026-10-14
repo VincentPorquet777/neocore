@@ -299,7 +299,7 @@ def consolidate(rows: Rows, path: Path, judge: Judge, *, prefix: str = "",
                 active: Iterable[str] | None = None, max_calls: int = 1, tau: float = TAU,
                 model: str = "") -> dict[str, int]:
     """Judge the topic groups of facts not yet seen, in at most ``max_calls`` model calls.
-    ``prefix`` names the recall tables (``fp_`` in OpenNeoCore); ``active`` is the Evidence
+    ``prefix`` names the recall tables (e.g. ``fp_``); ``active`` is the Evidence
     recall may currently show (None: all); ``model`` limits grouping to that embedder's vectors;
     ``tau`` is the similarity at which two facts share a topic. Returns counts; ``busy`` means
     another worker holds the verdicts file, ``skipped`` that numpy is not installed."""
