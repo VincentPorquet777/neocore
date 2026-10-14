@@ -4,6 +4,9 @@
     neocore uninstall
     neocore doctor
     neocore recall "QUERY" | status | stats | sync | forget ... (see ``neocore -h``)
+    neocore connect --url URL --key-file FILE [--ssh HOST --socket PATH] [--tools-only]
+    neocore disconnect
+    neocore server init | serve | keys | scopes | audit | export | forget  (shared memory)
 
 Setup only edits what it names: ``~/.claude/settings.json`` (two hooks, merged, a backup kept)
 and ``~/.codex/config.toml`` (an MCP server and two hooks inside marked lines). Codex asks you
@@ -27,7 +30,12 @@ from neocore.assistant import memory
 
 EMBEDDER = "bge-small-en-v1.5-onnx-Q"
 EMBEDDER_URL = "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/main/"
-EMBEDDER_FILES = ("model_optimized.onnx", "tokenizer.json", "config.json")
+# Pinned: a download that does not match is refused, never loaded.
+EMBEDDER_FILES = {
+    "model_optimized.onnx": "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431",
+    "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    "config.json": "13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd",
+}
 BEGIN, END = "# >>> neocore >>>", "# <<< neocore <<<"
 
 
@@ -119,18 +127,48 @@ def _backup(path: Path) -> None:
         shutil.copy2(path, path.with_name(path.name + ".before-neocore"))
 
 
-def _download_embedder(target: Path) -> str:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _download_embedder(target: Path, opener: Any = None) -> str:
+    """Fetch the pinned embedder files into ``target``; refuse any file whose hash differs."""
+    opener = opener or urllib.request.urlopen
     target.mkdir(parents=True, exist_ok=True)
-    for name in EMBEDDER_FILES:
-        if (target / name).exists():
+    for name, pinned in EMBEDDER_FILES.items():
+        final = target / name
+        if final.exists() and _sha256(final) == pinned:
             continue
         print(f"  downloading {name} ...", flush=True)
         partial = target / (name + ".part")
-        with urllib.request.urlopen(EMBEDDER_URL + name, timeout=120) as response:  # noqa: S310
+        with opener(EMBEDDER_URL + name, timeout=120) as response:
             partial.write_bytes(response.read())
-        partial.replace(target / name)
-    digest = hashlib.sha256((target / EMBEDDER_FILES[0]).read_bytes()).hexdigest()[:12]
-    return digest
+        if _sha256(partial) != pinned:
+            partial.unlink()
+            raise OSError(f"{name} does not match its pinned hash; not used")
+        partial.replace(final)
+    return next(iter(EMBEDDER_FILES.values()))[:12]
+
+
+def install_hooks(*, claude: bool, codex: bool) -> None:
+    """Add (or refresh) NeoCore's hooks and MCP server; earlier files are backed up first."""
+    if claude:
+        path = _claude_settings()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        _backup(path)
+        path.write_text(json.dumps(claude_hooks(current), indent=2) + "\n", encoding="utf-8")
+    if codex:
+        path = _codex_config()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        _backup(path)
+        path.write_text(without_codex_block(text).rstrip("\n") + "\n\n" + codex_block(),
+                        encoding="utf-8")
 
 
 def setup(args: argparse.Namespace) -> None:
@@ -163,19 +201,7 @@ def setup(args: argparse.Namespace) -> None:
         except OSError as error:
             print(f"  embedder download failed ({error}); recall stays lexical for now")
     memory._write_json(config_path, config)
-    if not args.no_claude:
-        path = _claude_settings()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        _backup(path)
-        path.write_text(json.dumps(claude_hooks(current), indent=2) + "\n", encoding="utf-8")
-    if not args.no_codex:
-        path = _codex_config()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        text = path.read_text(encoding="utf-8") if path.exists() else ""
-        _backup(path)
-        path.write_text(without_codex_block(text).rstrip("\n") + "\n\n" + codex_block(),
-                        encoding="utf-8")
+    install_hooks(claude=not args.no_claude, codex=not args.no_codex)
     print("Done. Your next prompt starts the memory daemon; existing Claude Code and Codex "
           "history is read on the first sync (`neocore sync`).")
     if not args.no_codex:
@@ -222,7 +248,11 @@ def forget(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
-    own = {"setup": setup, "uninstall": uninstall, "doctor": doctor, "forget": forget}
+    if argv[:1] in (["connect"], ["disconnect"], ["server"]):
+        from neocore.shared import manage
+
+        sys.exit(manage.main(argv))
+    own ={"setup": setup, "uninstall": uninstall, "doctor": doctor, "forget": forget}
     if not argv or argv[0] not in own:
         memory.main(argv)  # hooks, daemon, recall, sync, status, stats ...
         return

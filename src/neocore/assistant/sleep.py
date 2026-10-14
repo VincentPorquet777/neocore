@@ -9,6 +9,9 @@ version or decision) or ``duplicate``. Recall shows a duplicate as its fuller tw
 newest replacement in beside a superseded or outdated fact, marked as replaced, so what arrives
 says what is true now. Nothing is deleted: verdicts live in
 ``sleep.json`` beside the store, and removing that file brings every fact back. Dev memory only.
+
+Facts are only ever compared with facts of the same scope (a memory server keeps several people's
+or teams' memories in one store): a fact in one scope never retires, or replaces, another's.
 """
 
 from __future__ import annotations
@@ -113,6 +116,7 @@ def reopen(rows: Callable[..., Any], inactive: set[str], home: Path) -> int:
         if fact["id"] not in seen or (verdicts.get(fact["id"]) or [""])[0] != "history":
             continue
         later = matrix[index + 1:] @ matrix[index]
+        later = later[[f["scope"] == fact["scope"] for f in facts[index + 1:]]]
         if later.size and float(np.max(later)) >= TAU:
             seen.discard(fact["id"])
             reopened += 1
@@ -140,8 +144,11 @@ def _facts(rows: Callable[..., Any], inactive: set[str]) -> tuple[list[dict[str,
     import numpy as np
 
     sources: dict[str, list[str]] = {}
-    for row in rows("SELECT fact_id,evidence_id FROM recall_fact_sources"):
+    scopes: dict[str, set[str]] = {}
+    for row in rows("SELECT s.fact_id,s.evidence_id,e.sensitivity FROM recall_fact_sources s "
+                    "LEFT JOIN evidence e ON e.evidence_id=s.evidence_id"):
         sources.setdefault(str(row["fact_id"]), []).append(str(row["evidence_id"]))
+        scopes.setdefault(str(row["fact_id"]), set()).add(str(row["sensitivity"] or ""))
     facts: list[dict[str, str]] = []
     vectors = []
     for row in rows("SELECT f.fact_id,f.occurred_at,f.text,v.vector FROM recall_facts f "
@@ -150,7 +157,8 @@ def _facts(rows: Callable[..., Any], inactive: set[str]) -> tuple[list[dict[str,
         if fact_sources and all(e in inactive for e in fact_sources):
             continue  # every source was withdrawn
         facts.append({"id": str(row["fact_id"]), "at": str(row["occurred_at"]),
-                      "text": str(row["text"])})
+                      "text": str(row["text"]),
+                      "scope": ",".join(sorted(scopes.get(str(row["fact_id"]), set())))})
         vectors.append(np.frombuffer(row["vector"], dtype=np.float32))
     if not facts:
         return [], None
@@ -179,6 +187,7 @@ def sleep(rows: Callable[..., Any], inactive: set[str], home: Path, judge: Judge
         if fact["id"] in seen or index in grouped:
             continue
         similarity = matrix @ matrix[index]
+        similarity[[f["scope"] != fact["scope"] for f in facts]] = -1.0
         near = [int(i) for i in np.argsort(-similarity)[: NEIGHBOURS + 1]
                 if similarity[i] >= TAU and int(i) != index]
         if not near:
@@ -188,8 +197,9 @@ def sleep(rows: Callable[..., Any], inactive: set[str], home: Path, judge: Judge
         groups.append(group)
         grouped.update(i for i in group if facts[i]["id"] not in seen)
     packs: list[list[list[int]]] = []
-    for group in groups:
-        if packs and sum(map(len, packs[-1])) + len(group) <= PACK:
+    for group in groups:  # one call reads one scope's facts
+        if (packs and sum(map(len, packs[-1])) + len(group) <= PACK
+                and facts[packs[-1][0][0]]["scope"] == facts[group[0]]["scope"]):
             packs[-1].append(group)
         else:
             packs.append([group])

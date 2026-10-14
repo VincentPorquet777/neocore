@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -351,8 +351,21 @@ def codex_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
                 pending = None
 
 
+def transcript_sources() -> list[tuple[str, Path, Callable[[Path, int], Iterator[tuple[Turn, int]]]]]:
+    """Where each host keeps its transcripts, and how to read them."""
+    codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    return [
+        ("claude-code", Path.home() / ".claude" / "projects", claude_turns),
+        ("codex", codex / "sessions", codex_turns),
+        ("codex", codex / "archived_sessions", codex_turns),
+    ]
+
+
+_LOAD = object()  # DevMemory(embedder=...): load the one config.json names
+
+
 class DevMemory:
-    def __init__(self, home: Path | None = None) -> None:
+    def __init__(self, home: Path | None = None, *, embedder: Any = _LOAD) -> None:
         from neocore.recall import GovernedRecall
         from neocore.store import Store
 
@@ -361,8 +374,9 @@ class DevMemory:
         home.mkdir(parents=True, exist_ok=True)
         self.config = _read_json(home / "config.json")
         self.store = Store(home / "neocore.db")
-        embedder = None
-        model_dir = str(self.config.get("embedder_dir") or "")
+        model_dir = str(self.config.get("embedder_dir") or "") if embedder is _LOAD else ""
+        if embedder is _LOAD:
+            embedder = None  # a memory server shares one loaded embedder between its instances
         if model_dir:
             try:
                 from neocore.embedder import LocalEmbedder
@@ -387,11 +401,16 @@ class DevMemory:
 
     # -- capture ---------------------------------------------------------------------------
 
-    def capture(self, turn: Turn) -> bool:
+    def capture(self, turn: Turn, scope: str = SCOPE) -> bool:
+        return self.capture_status(turn, scope) == "captured"
+
+    def capture_status(self, turn: Turn, scope: str = SCOPE) -> str:
+        """``captured``, ``duplicate`` (already stored) or ``rejected`` (no ids, or a throwaway
+        temp folder). ``scope`` is the memory it goes to: a server passes the key's write scope."""
         if not (turn.session_id and turn.turn_id) or is_scratch_project(turn.project):
-            return False
+            return "rejected"
         conversation = f"{turn.host}:{turn.session_id}"
-        return bool(self.store.capture_turn(
+        stored = self.store.capture_turn(
             thread_id=conversation,
             # Branch identity is global, so each conversation owns its branch.
             branch_id=f"{conversation}:{BRANCH}",
@@ -399,9 +418,10 @@ class DevMemory:
             user=redact(turn.user)[:USER_CHARACTERS],
             assistant=redact(with_actions(turn.assistant, turn.actions, ASSISTANT_CHARACTERS)),
             occurred_at=turn.occurred_at or None,
-            scope=SCOPE,
+            scope=scope,
             metadata={"host": turn.host, "project": turn.project},
-        ))
+        )
+        return "captured" if stored else "duplicate"
 
     def ingest(self, keep: Callable[[], None] | None = None) -> dict[str, int]:
         """Capture the turns added to each transcript since ``offsets.json``. ``keep`` is called
@@ -409,12 +429,7 @@ class DevMemory:
         state_path = self.home / "offsets.json"
         state = _read_json(state_path)
         counts = {"claude-code": 0, "codex": 0}
-        sources = [
-            ("claude-code", Path.home() / ".claude" / "projects", claude_turns),
-            ("codex", Path.home() / ".codex" / "sessions", codex_turns),
-            ("codex", Path.home() / ".codex" / "archived_sessions", codex_turns),
-        ]
-        for host, root, reader in sources:
+        for host, root, reader in transcript_sources():
             if not root.is_dir():
                 continue
             for path in sorted(root.rglob("*.jsonl")):
@@ -436,10 +451,17 @@ class DevMemory:
     def recall(
         self, query: str, *, exclude_session: str = "", host: str = "", since: str = "",
         last: Turn | None = None, timing: dict[str, int] | None = None,
+        scopes: Collection[str] = (SCOPE,), delivered: set[str] | None = None,
     ) -> str:
         """Recall for ``query``, leaving out what the asking session still holds in context:
         its turns ``since`` its last compaction (all of them when it was never compacted).
-        ``timing``: milliseconds the caller already spent, logged with this recall's own."""
+        ``timing``: milliseconds the caller already spent, logged with this recall's own.
+        ``scopes``: the memories the asker may read (a server passes its key's read scopes).
+        ``delivered``: given, the ids shown are added to it and not yet recorded as held by the
+        chat; the caller records them (``hold``) once the text really reached it."""
+        allowed = set(scopes)
+        if not allowed:
+            raise PermissionError("recall requires at least one allowed scope")
         timing = dict(timing or {})
         clock = [time.perf_counter()]
 
@@ -495,7 +517,7 @@ class DevMemory:
         def search(text: str) -> Any:
             return self.recall_engine.recall(
                 text,
-                allowed_scopes={SCOPE},
+                allowed_scopes=allowed,
                 exclude_evidence_ids=excluded,
                 # Judged on 184 real questions: the answer is usually in the best turn, a few
                 # lines from the words that matched.
@@ -532,11 +554,16 @@ class DevMemory:
                         newer_of.setdefault(str(r["evidence_id"]), []).append(replaced[fact])
             wanted = list(dict.fromkeys([*fact_ids, *(f for ids in newer_of.values()
                                                       for f in ids)]))
+            # A replacement comes from sleep's verdicts, not from recall: read it only when the
+            # asker may read every one of its sources (scope, not withdrawn, not forgotten).
+            marks = ",".join("?" * len(allowed))
             facts = {
                 str(r["fact_id"]): {"kind": "fact", "id": str(r["fact_id"]),
                                     "text": str(r["text"]), "occurred_at": str(r["occurred_at"])}
                 for r in rows("SELECT fact_id,text,occurred_at FROM recall_facts WHERE "
-                              f"fact_id IN ({','.join('?' * len(wanted))})", tuple(wanted))
+                              f"fact_id IN ({','.join('?' * len(wanted))}) AND NOT "
+                              + dev_render.unreadable_source(marks, "recall_facts.fact_id"),
+                              (*wanted, *sorted(allowed)))
             } if wanted else {}
             for fact_id, fact in facts.items():
                 if fact_id in replaced and fact_id not in duplicates:
@@ -600,7 +627,10 @@ class DevMemory:
         chosen = sorted(chosen, key=lambda i: not dev_render.is_lesson(i))
         shown: set[str] = set()
         rendered = dev_render.render(chosen, origin, budget, shown)
-        self._hold(host, exclude_session, since, shown)
+        if delivered is None:
+            self._hold(host, exclude_session, since, shown)
+        else:
+            delivered.update(shown)
         record["held"] = len(held)
         record["bytes_kept"] = len(rendered.encode())
         lap("render")
@@ -618,6 +648,10 @@ class DevMemory:
         with _HELD_LOCK:
             entry = _read_json(self.home / "held.json").get(f"{host}:{session}") or {}
         return set(entry.get("ids", [])) if entry.get("since", "") == since else set()
+
+    def hold(self, host: str, session: str, since: str, ids: set[str]) -> None:
+        """Record that a chat received ``ids`` (its window holds them until it is compacted)."""
+        self._hold(host, session, since, ids)
 
     def _hold(self, host: str, session: str, since: str, ids: set[str]) -> None:
         if not (session and ids):
@@ -865,10 +899,11 @@ def _alive(pid: int) -> bool:
         kernel.CloseHandle(handle)  # 259 = STILL_ACTIVE
 
 
-def _claim_daemon() -> bool:
-    """One warm daemon per store: claim ``serve.lock`` unless a live daemon holds it."""
+def _claim_daemon(lock: Path | None = None) -> bool:
+    """One warm daemon per store: claim ``serve.lock`` (or ``lock``) unless a live process
+    holds it."""
 
-    lock = HOME / "serve.lock"
+    lock = lock or HOME / "serve.lock"
     for _ in range(2):
         try:
             descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -1103,15 +1138,28 @@ def claude_prompt_hook(host: str = "claude-code") -> None:
         # context, and recall on two words only adds noise.
         if len(query_terms(prompt)) < MIN_PROMPT_TERMS or is_machine_prompt(prompt):
             return
-        answer = _ask_daemon(prompt, str(event.get("session_id") or ""), host,
-                             str(event.get("transcript_path") or ""),
-                             notices=host in NOTICE_HOSTS)
-        if answer is None:
-            _detached("serve")  # warm up for the next prompt; never delay this one
-            _log_miss(host, "no-daemon")
-            return
+        from neocore.shared import client
+
+        session, transcript = str(event.get("session_id") or ""), str(
+            event.get("transcript_path") or "")
+        remote = client.load(HOME)
+        if remote is not None:  # the memory lives on a server (``neocore connect``)
+            answer = client.ask(remote, HOME, prompt, session, host, transcript,
+                                seconds=ASK_SECONDS)
+            source = "remote"
+            if not answer.get("error"):
+                from neocore.assistant.filter import count_miss
+
+                count_miss(HOME, missed=False)  # the daemon does this itself in local mode
+        else:
+            local = _ask_daemon(prompt, session, host, transcript, notices=host in NOTICE_HOSTS)
+            if local is None:
+                _detached("serve")  # warm up for the next prompt; never delay this one
+                _log_miss(host, "no-daemon")
+                return
+            answer, source = local, "daemon"
         if answer.get("error"):
-            _log_miss(host, f"daemon-{answer['error']}")
+            _log_miss(host, f"{source}-{answer['error']}")
             if answer["error"] != "starting":  # after a release or an idle night: expected
                 from neocore.assistant.filter import count_miss, notice
 
@@ -1133,7 +1181,30 @@ def claude_prompt_hook(host: str = "claude-code") -> None:
 def claude_stop_hook() -> None:
     if os.environ.get("NEOCORE_DISABLED"):
         return
-    _detached("sync")
+    from neocore.shared import client
+
+    remote = client.load(HOME)
+    if remote is None:
+        _detached("sync")
+    elif remote.upload:
+        _detached("upload")  # the server indexes and forms facts; this machine only sends
+
+
+def _upload() -> dict[str, Any]:
+    """Send this machine's new turns to the memory server, one upload at a time."""
+    from neocore.shared import client
+
+    remote = client.load(HOME)
+    if remote is None:
+        return {"skipped": "not connected to a memory server"}
+    lock = HOME / "upload.lock"
+    HOME.mkdir(parents=True, exist_ok=True)
+    if not _claim_sync(lock):
+        return {"skipped": "another upload is running"}
+    try:
+        return client.upload_new(remote, HOME, keep=lambda: _renew_sync(lock))
+    finally:
+        _release_sync(lock)
 
 
 _TOOL = {
@@ -1152,17 +1223,26 @@ _TOOL = {
 
 
 def mcp_server() -> None:
+    from neocore.shared import client
+
     memory_box: dict[str, DevMemory] = {}
+    remote = client.load(HOME)
 
     def background() -> None:
         while True:
             try:
-                _sync()
+                if remote is None:
+                    _sync()
+                elif remote.upload:
+                    _upload()
             except Exception:
                 pass
             time.sleep(300)
 
     threading.Thread(target=background, daemon=True).start()
+    if remote is not None:
+        _remote_mcp(remote)
+        return
     for line in sys.stdin:
         try:
             request = json.loads(line)
@@ -1207,11 +1287,43 @@ def mcp_server() -> None:
         print(json.dumps({"jsonrpc": "2.0", "id": ident, "result": result}), flush=True)
 
 
+def _remote_mcp(remote: Any) -> None:
+    """The memory tools of the server this device is connected to. ``initialize`` and the tool
+    list are answered here, so a host starts even while the server is away; calls go to it."""
+    from neocore.shared import client
+    from neocore.shared.tools import TOOLS, protocol_version
+
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(request, dict) or request.get("id") is None:
+            continue  # a notification
+        method, ident = request.get("method"), request.get("id")
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        if method == "initialize":
+            reply: Any = {"jsonrpc": "2.0", "id": ident, "result": {
+                "protocolVersion": protocol_version(params.get("protocolVersion")),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "neocore", "version": __version__}}}
+        elif method == "tools/list":
+            reply = {"jsonrpc": "2.0", "id": ident, "result": {"tools": TOOLS}}
+        elif method == "ping":
+            reply = {"jsonrpc": "2.0", "id": ident, "result": {}}
+        elif method == "tools/call":
+            reply = client.mcp(remote, HOME, request)
+        else:
+            reply = {"jsonrpc": "2.0", "id": ident,
+                     "error": {"code": -32601, "message": "method not found"}}
+        print(json.dumps(reply), flush=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="neocore")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("sync", "claude-prompt-hook", "claude-stop-hook", "codex-prompt-hook",
-                 "codex-stop-hook", "mcp", "status", "serve", "embed-all"):
+                 "codex-stop-hook", "mcp", "status", "serve", "embed-all", "upload"):
         sub.add_parser(name)
     sub.add_parser("recall").add_argument("query")
     sub.add_parser("stats").add_argument("--days", type=float, default=7.0)
@@ -1220,6 +1332,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "sync":
         print(json.dumps(_sync(), indent=1))
+    elif args.command == "upload":
+        print(json.dumps(_upload(), indent=1))
     elif args.command == "claude-prompt-hook":
         claude_prompt_hook()
     elif args.command == "codex-prompt-hook":
@@ -1266,6 +1380,8 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(dev_lessons.backfill(
             memory.store.rows, memory.recall_engine.add_fact,
             memory.home, ask, max_calls=args.calls), indent=1))
+    elif args.command == "status" and (remote := _remote_status()) is not None:
+        print(json.dumps(remote, indent=1))
     elif args.command == "status":
         memory = DevMemory()
         rows = memory.store.rows
@@ -1278,6 +1394,13 @@ def main(argv: list[str] | None = None) -> None:
             "vectors": rows("SELECT count(*) n FROM recall_vectors")[0]["n"],
             "facts": rows("SELECT count(*) n FROM recall_facts")[0]["n"],
         }, indent=1))
+
+
+def _remote_status() -> dict[str, Any] | None:
+    from neocore.shared import client
+
+    remote = client.load(HOME)
+    return None if remote is None else client.status(remote, HOME)
 
 
 if __name__ == "__main__":

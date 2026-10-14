@@ -734,7 +734,8 @@ def test_sleep_retires_superseded_facts_and_can_be_undone(tmp_path: Path) -> Non
 
     def rows(sql: str, *args: Any) -> list[dict[str, Any]]:
         if "recall_fact_sources" in sql:
-            return [{"fact_id": f["fact_id"], "evidence_id": "e-" + f["fact_id"]} for f in facts]
+            return [{"fact_id": f["fact_id"], "evidence_id": "e-" + f["fact_id"],
+                     "sensitivity": f.get("scope", "internal")} for f in facts]
         return facts
 
     prompts: list[str] = []
@@ -753,6 +754,35 @@ def test_sleep_retires_superseded_facts_and_can_be_undone(tmp_path: Path) -> Non
     (tmp_path / "sleep.json").unlink()
     assert dev_sleep.hidden(tmp_path) == set()
     assert dev_sleep.sleep(rows, {"e-new"}, tmp_path, judge)["calls"] == 0 and len(prompts) == 1
+
+
+def test_sleep_never_compares_facts_of_different_scopes(tmp_path: Path) -> None:
+    """One server, two people: Bea's newer fact must not retire (or replace) Al's."""
+    import numpy as np
+
+    from neocore.assistant import sleep as dev_sleep
+
+    def vector(*values: float) -> bytes:
+        return np.array(values, dtype=np.float32).tobytes()
+
+    facts = [
+        {"fact_id": "al", "occurred_at": "2026-09-20", "text": "The VPN runs on port 51820.",
+         "vector": vector(1, 0.1, 0), "scope": "al"},
+        {"fact_id": "bea", "occurred_at": "2026-09-27", "text": "The VPN runs on port 51821.",
+         "vector": vector(1, 0.12, 0), "scope": "bea"},
+    ]
+
+    def rows(sql: str, *args: Any) -> list[dict[str, Any]]:
+        if "recall_fact_sources" in sql:
+            return [{"fact_id": f["fact_id"], "evidence_id": "e-" + f["fact_id"],
+                     "sensitivity": f["scope"]} for f in facts]
+        return facts
+
+    def judge(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("facts of two scopes were sent to be judged together")
+
+    assert dev_sleep.sleep(rows, set(), tmp_path, judge)["calls"] == 0
+    assert dev_sleep.replacements(tmp_path) == {}
 
 
 def test_reopen_lets_sleep_judge_again_history_that_has_newer_neighbours(tmp_path: Path) -> None:

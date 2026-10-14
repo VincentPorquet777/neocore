@@ -300,8 +300,9 @@ def notice(home: Path, *, now: float | None = None) -> str:
     misses = int(health.get("daemon_misses") or 0)
     if misses >= FAILURES_TO_ALERT:
         warnings.append(("daemon", (
-            f"NeoCore memory: the last {misses} prompts got no memory because the memory daemon "
-            "did not answer in time. Details: neocore stats")))
+            f"NeoCore memory: the last {misses} prompts got no memory because the memory "
+            "(this machine's daemon, or the memory server it is connected to) did not answer in "
+            "time. Details: neocore stats, neocore status")))
     credit = health.get("credit")
     if isinstance(credit, (int, float)) and credit < LOW_CREDIT:
         warnings.append(("credit", (

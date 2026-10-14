@@ -89,6 +89,26 @@ neocore stats --days 7    # live relevance, latency and error estimates
 neocore forget claude-code:<session-id>   # erase a conversation for good (audited)
 ```
 
+## One memory across machines
+
+Run the memory on one always-on machine (a home PC or a small VPS) and connect every other
+machine to it. Tell Claude Code on your laptop something once; Codex on your desktop knows it in
+its next chat's first message.
+
+```bash
+# on the machine that keeps the memory
+neocore server init --person alex --device laptop --device desktop
+# on each device, with the key file that device was given
+neocore connect --url https://memory.example.com --key-file laptop.key
+```
+
+Each device has its own key, stored hashed on the server and revocable at once. Keys carry
+scopes, so one server can keep separate memories that never mix. Nothing is lost while the server
+is away: a device's transcripts are its queue. Admin commands (`neocore server scopes`, `audit`,
+`export`, `forget`) never show memory text unless asked to export it. One-command installers for
+Linux, macOS and Windows are in `scripts/install/`. Full guide:
+[docs/shared-memory.md](docs/shared-memory.md).
+
 ## Quick start: any assistant
 
 ```python

@@ -20,7 +20,7 @@ HOSTS = {"claude-code": "Claude Code", "codex": "Codex"}
 ASSISTANTS = {"claude-code": "Claude", "codex": "Codex"}
 HEAD = (
     "<neocore_memory>\n"
-    "Your memory of earlier work with this user, shared by Claude Code and Codex on this PC. "
+    "Your memory of earlier work with this user, shared by Claude Code and Codex. "
     "Dated and in time order; where two items disagree, the newer one holds. Check live state "
     "before acting on anything that may have changed since. Items marked (replaced) are history: "
     "a newer item beside them says what holds now.\n"
@@ -43,6 +43,20 @@ def is_lesson(item: dict[str, Any]) -> bool:
 def project_name(cwd: str) -> str:
     name = PureWindowsPath(cwd.rstrip("\\/")).name if cwd else ""
     return name or "no project"
+
+
+# Evidence whose latest access decision is not "active" (revoked or forgotten).
+WITHDRAWN = ("SELECT d.evidence_id FROM evidence_access d WHERE d.state<>'active' "
+             "AND d.created_at=(SELECT max(x.created_at) FROM evidence_access x "
+             "WHERE x.evidence_id=d.evidence_id)")
+
+
+def unreadable_source(marks: str, fact: str) -> str:
+    """SQL: the fact ``fact`` has a source outside the scopes ``marks`` stands for, withdrawn, or
+    gone (forgotten evidence is deleted). Bind the scopes after the statement's other values."""
+    return ("EXISTS (SELECT 1 FROM recall_fact_sources s LEFT JOIN evidence e "
+            f"ON e.evidence_id=s.evidence_id WHERE s.fact_id={fact} AND (e.evidence_id IS NULL "
+            f"OR e.sensitivity NOT IN ({marks}) OR e.evidence_id IN ({WITHDRAWN})))")
 
 
 def provenance(
