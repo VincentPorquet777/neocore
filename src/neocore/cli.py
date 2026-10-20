@@ -1,6 +1,8 @@
 """``neocore``: set up shared memory for Claude Code and Codex, then run its hooks.
 
-    neocore setup [--dry-run] [--no-embedder] [--no-claude] [--no-codex]
+    neocore setup [--dry-run] [--no-embedder] [--no-sift] [--no-claude] [--no-codex]
+    neocore sift install [--force] | remove | status   (NeoSift, the local relevance filter)
+    neocore share on | off | status | send | delete     (opt-in: help train NeoSift)
     neocore uninstall
     neocore doctor
     neocore recall "QUERY" | status | stats | sync | forget ... (see ``neocore -h``)
@@ -20,13 +22,14 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from neocore import llm
-from neocore.assistant import memory
+from neocore.assistant import memory, neosift, share
 
 EMBEDDER = "bge-small-en-v1.5-onnx-Q"
 EMBEDDER_URL = "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/main/"
@@ -179,8 +182,15 @@ def setup(args: argparse.Namespace) -> None:
     if not args.no_embedder and not config.get("embedder_dir"):
         plan.append(f"download the {EMBEDDER} embedder (~35 MB) from Hugging Face")
     key = bool(os.environ.get("OPENROUTER_API_KEY")) or bool(config.get("relevance_key_file"))
-    plan.append("relevance filter: " + ("Jev on OpenRouter (filter)" if key else
-                                        "none (set OPENROUTER_API_KEY to enable)"))
+    device = "" if args.no_sift or neosift.installed(home) else neosift.gpu()
+    if device:
+        plan.append("relevance filter: NeoSift on this machine's graphics card")
+        plan += ["  " + line for line in neosift.plan(device)[1:]]
+    else:
+        plan.append("relevance filter: " + (
+            "NeoSift (installed)" if neosift.installed(home) else
+            "Jev on OpenRouter (filter)" if key else
+            "none: no graphics card for NeoSift (set OPENROUTER_API_KEY for the hosted one)"))
     plan.append(f"background model for facts, sleep and lessons: {llm.backend(config)}")
     if not args.no_claude:
         plan.append(f"Claude Code hooks in {_claude_settings()}")
@@ -200,6 +210,13 @@ def setup(args: argparse.Namespace) -> None:
             config["embedder_dir"] = target.as_posix()
         except OSError as error:
             print(f"  embedder download failed ({error}); recall stays lexical for now")
+    if device:
+        try:
+            config.update(neosift.install(home))
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            print(f"  NeoSift not installed ({error}); recall works without it")
+    if "share" not in config:
+        config["share"] = _ask_share()
     memory._write_json(config_path, config)
     install_hooks(claude=not args.no_claude, codex=not args.no_codex)
     print("Done. Your next prompt starts the memory daemon; existing Claude Code and Codex "
@@ -228,6 +245,8 @@ def doctor(_: argparse.Namespace) -> None:
         "embedder": config.get("embedder_dir") or "none (lexical recall only)",
         "background model": llm.backend(config),
         "relevance filter": config.get("relevance", "off"),
+        "relevance scorer": config.get("relevance_scorer", "jev"),
+        "neosift installed": neosift.installed(memory.HOME),
         "claude hooks": "neocore" in (_claude_settings().read_text(encoding="utf-8")
                                       if _claude_settings().exists() else ""),
         "codex block": BEGIN in (_codex_config().read_text(encoding="utf-8")
@@ -235,6 +254,61 @@ def doctor(_: argparse.Namespace) -> None:
         "daemon running": bool(memory._read_json(memory.HOME / "daemon.json")),
     }
     print(json.dumps(checks, indent=1))
+
+
+def _ask_share() -> bool:
+    """Asked once, at setup; anything but yes (or no terminal to ask in) leaves it off."""
+    if not sys.stdin.isatty():
+        print("  sharing to improve NeoSift: off (`neocore share on` to help)")
+        return False
+    print("\n" + share.NOTICE)
+    try:
+        answer = input("Share to help improve NeoSift? [y/N] ")
+    except EOFError:
+        answer = ""
+    return answer.strip().lower() in ("y", "yes")
+
+
+def share_command(args: argparse.Namespace) -> None:
+    config_path = memory.HOME / "config.json"
+    config = memory._read_json(config_path)
+    if args.action in ("on", "off"):
+        if args.action == "on":
+            print(share.NOTICE)
+        memory._write_json(config_path, {**config, "share": args.action == "on"})
+        print(f"Sharing is {args.action}.")
+    elif args.action == "status":
+        print(json.dumps(share.status(memory.HOME, config), indent=1))
+    elif args.action == "send":
+        print(json.dumps(share.send(memory.HOME, force=True), indent=1))
+    else:
+        memory._write_json(config_path, {**config, "share": False})
+        print(json.dumps({**share.delete(memory.HOME), "sharing": "off"}, indent=1))
+
+
+def sift(args: argparse.Namespace) -> None:
+    config_path = memory.HOME / "config.json"
+    config = memory._read_json(config_path)
+    if args.action == "status":
+        print(json.dumps({"installed": neosift.installed(memory.HOME),
+                          "graphics card": neosift.gpu() or "none",
+                          "in use": config.get("relevance_scorer") == "neosift"}, indent=1))
+    elif args.action == "install":
+        print("NeoSift:\n  " + "\n  ".join(neosift.plan(neosift.gpu())))
+        try:
+            settings = neosift.install(memory.HOME, force=args.force)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            sys.exit(f"NeoSift not installed: {error}")
+        memory._write_json(config_path, {**config, **settings})
+        print("NeoSift is on. It starts with your next prompt.")
+    else:
+        neosift.remove(memory.HOME)
+        if config.get("relevance_scorer") == "neosift":
+            for setting in ("relevance_scorer", *neosift.POLICY):
+                config.pop(setting, None)
+            config["relevance"] = "off"
+            memory._write_json(config_path, config)
+        print("NeoSift removed; recall injects its top matches within the budget.")
 
 
 def forget(args: argparse.Namespace) -> None:
@@ -252,7 +326,8 @@ def main(argv: list[str] | None = None) -> None:
         from neocore.shared import manage
 
         sys.exit(manage.main(argv))
-    own ={"setup": setup, "uninstall": uninstall, "doctor": doctor, "forget": forget}
+    own = {"setup": setup, "uninstall": uninstall, "doctor": doctor, "forget": forget,
+           "sift": sift, "share": share_command}
     if not argv or argv[0] not in own:
         memory.main(argv)  # hooks, daemon, recall, sync, status, stats ...
         return
@@ -261,10 +336,17 @@ def main(argv: list[str] | None = None) -> None:
     one = sub.add_parser("setup", help="install hooks, download the embedder, write config")
     one.add_argument("--dry-run", action="store_true")
     one.add_argument("--no-embedder", action="store_true")
+    one.add_argument("--no-sift", action="store_true", help="skip NeoSift even with a GPU")
     one.add_argument("--no-claude", action="store_true")
     one.add_argument("--no-codex", action="store_true")
     sub.add_parser("uninstall", help="remove the hooks (keeps your memory)")
     sub.add_parser("doctor", help="check the installation")
+    one = sub.add_parser("sift", help="NeoSift, the local relevance filter (graphics card)")
+    one.add_argument("action", choices=("install", "remove", "status"))
+    one.add_argument("--force", action="store_true", help="install even if it is too slow")
+    one = sub.add_parser("share", help="opt-in: share prompts and recalled memories to train "
+                                       "NeoSift (delete removes all you sent)")
+    one.add_argument("action", choices=("on", "off", "status", "send", "delete"))
     one = sub.add_parser("forget", help="delete a conversation from memory for good")
     one.add_argument("conversation", help="thread id, e.g. claude-code:<session id>")
     one.add_argument("--reason", default="")

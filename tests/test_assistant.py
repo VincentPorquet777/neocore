@@ -670,6 +670,51 @@ def test_relevance_filter_recalls_wide_from_a_cleaned_expanded_query(
     assert len(seen["inquiry"]) < 700  # only the reply's opening
 
 
+def test_short_follow_up_also_searches_with_the_prompt_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _jsonl(tmp_path / ".claude/projects/p/a.jsonl",
+           _claude("s1", "u1", "The Relay worker was installed fresh on 27 September.", "Ok.")
+           + _claude("s2", "u2", "Acme billing moved to monthly invoices in Ledgerly.", "Ok."))
+    (tmp_path / "dev").mkdir()
+    config = {"relevance": "filter", "facts_enabled": False}
+    (tmp_path / "dev/config.json").write_text(json.dumps(config))
+    memory = DevMemory(tmp_path / "dev")
+    memory.ingest()
+    memory.maintain()
+    batches: list[list[str]] = []
+    memory.gate._scorer = lambda prompt, context, texts: batches.append(texts) or [0.9] * len(texts)
+    memory.gate.second = False
+    inquiries: list[str] = []
+    engine_recall = memory.recall_engine.recall
+
+    def spy(inquiry: str, **kwargs: Any) -> Any:
+        inquiries.append(inquiry)
+        return engine_recall(inquiry, **kwargs)
+
+    monkeypatch.setattr(memory.recall_engine, "recall", spy)
+    reply = "Acme billing now runs through Ledgerly monthly invoices. " + "detail " * 100
+    last = Turn("claude-code", "s9", "u9", "p", "2026-10-20", "sort the billing", reply)
+    memory.recall("when was the Relay worker installed?", exclude_session="s9",
+                  host="claude-code", since="9999", last=last)
+    assert len(inquiries) == 2 and "Ledgerly" in inquiries[0]
+    assert inquiries[1] == "when was the Relay worker installed?"  # the prompt's own words
+    scored = [t for b in batches for t in b]
+    assert any("Relay worker was installed" in t for t in scored)
+    assert len(scored) == len(set(scored))  # found by both searches, scored once
+
+    inquiries.clear()
+    (tmp_path / "dev/config.json").write_text(json.dumps({**config, "solo_extra": 0}))
+    memory = DevMemory(tmp_path / "dev")
+    memory.gate._scorer = lambda prompt, context, texts: [0.9] * len(texts)
+    memory.gate.second = False
+    monkeypatch.setattr(memory.recall_engine, "recall", spy)
+    memory.recall("when was the Relay worker installed?", exclude_session="s9",
+                  host="claude-code", since="9999", last=last)
+    assert len(inquiries) == 1
+
+
 def test_second_search_follows_the_best_memories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

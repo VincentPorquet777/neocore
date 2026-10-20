@@ -1,0 +1,7 @@
+NeoCore
+Copyright 2026 Vincent Porquet
+
+NeoSift 32M (the model downloaded by `neocore sift install`) is fine-tuned from
+cross-encoder/ettin-reranker-32m-v1 (https://huggingface.co/cross-encoder/ettin-reranker-32m-v1),
+licensed under the Apache License 2.0, which is in turn fine-tuned from
+jhu-clsp/ettin-encoder-32m (https://huggingface.co/jhu-clsp/ettin-encoder-32m).

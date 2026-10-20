@@ -75,10 +75,14 @@ After setup:
   are redacted) and indexes them.
 - **In the background**, your own Codex or Claude Code sign-in forms dated facts, runs sleep and
   writes lessons (see `neocore.llm`). No API key is needed. Nothing is sent anywhere else.
-- **Optional relevance filter:** set `OPENROUTER_API_KEY` before `neocore setup` and each recall
-  is scored by a small hosted decision model (~$0.0007 per prompt). Only items above the
-  policy threshold are injected. On 300 graded real prompts this lifted the relevant share of
-  injected memory from 9% to 53%. Without it, recall injects the top matches within the budget.
+- **Relevance filter (NeoSift):** on a machine with a graphics card, setup installs
+  [NeoSift](#neosift-the-local-relevance-filter), NeoCore's own small model that keeps only the
+  memories that help with this prompt. It is free and local. Without a graphics card, set
+  `OPENROUTER_API_KEY` before `neocore setup` to use a small hosted decision model instead
+  (~$0.0007 per prompt), or recall injects its top matches within the budget.
+- **Help improve NeoSift (opt-in):** setup asks once whether to share prompts and recalled
+  memories to train NeoSift. It is off unless you say yes. See
+  [what is shared](#help-improve-neosift-opt-in).
 
 Useful commands:
 
@@ -87,7 +91,70 @@ neocore recall "how did we deploy the worker last time"
 neocore status            # counts and configuration
 neocore stats --days 7    # live relevance, latency and error estimates
 neocore forget claude-code:<session-id>   # erase a conversation for good (audited)
+neocore sift status       # NeoSift: installed, graphics card, in use
+neocore share status      # opt-in sharing: on/off, rows waiting and sent
 ```
+
+## NeoSift: the local relevance filter
+
+Recall finds candidates by words and meaning, but many of them only share words with the
+prompt. NeoSift is a 32M-parameter cross-encoder that reads the prompt, the end of the turn
+before it and each candidate memory, and gives the chance that the memory would help. Only the
+best are injected (score >= 0.4, at most 12).
+
+It was trained on real coding-assistant prompts whose candidate memories were graded by a
+frontier model (GPT-6.1). On 103 held-out real prompts, ranking useful memories above useless
+ones:
+
+| Scorer | Where it runs | Score |
+| --- | --- | --- |
+| GPT-6.1 (the teacher) | hosted | 0.970 |
+| TypeSafe Jev 1.13 | hosted, ~$0.0007 per prompt | 0.931 |
+| **NeoSift 32M** | **your graphics card, free** | **0.914** |
+
+On prompts where no memory was useful, NeoSift still let something through 40% of the time,
+against 74% for Jev. On 885 real prompts graded *after* their replies, the default cut-off
+injected 5.7 memories per prompt and caught 66% of the memories the replies needed. Raising the
+cut-off trades needed memories away about as fast as it saves space.
+
+**It needs a graphics card.** One prompt (48 candidates) takes 0.07 s on an RTX 3080, but 7-8 s
+on a desktop processor, longer than a prompt can wait. So `neocore setup` installs it only when
+it finds an NVIDIA card or Apple silicon, and only if a speed check passes:
+
+```bash
+neocore sift install      # or: neocore setup (does it when a graphics card is found)
+neocore sift remove
+```
+
+It lives in `~/.neocore/sift`: its own Python environment (torch, transformers, ~2-3 GB), the
+pinned model (~120 MB, hash-checked) and a server on `127.0.0.1` that keeps nothing. If it ever
+cannot answer in time, that prompt gets unfiltered recall instead of none. NeoSift is
+fine-tuned from [Ettin](https://huggingface.co/cross-encoder/ettin-reranker-32m-v1)
+(Apache-2.0); see [NOTICE](NOTICE).
+
+## Help improve NeoSift (opt-in)
+
+NeoSift gets better with more real prompts. `neocore setup` asks once:
+
+> Help improve NeoSift? If you say yes, NeoCore sends the prompts it recalls memory for, the
+> memories it offered and their scores, encrypted, to the NeoCore team. An AI model grades them
+> and they are used only to train NeoSift, which outputs scores and cannot reproduce text. Your
+> content is never used as knowledge, shared or sold. It is stored encrypted so future versions
+> keep learning from it. Off by default. Stop any time with `neocore share off`, or remove
+> everything you sent with `neocore share delete`.
+
+What that means exactly (the code is [share.py](src/neocore/assistant/share.py)):
+
+- **Sent:** the prompt, the user turn and the end of the reply before it, and the memories
+  recall offered with their scores, after NeoCore's usual secret redaction. Never replies,
+  tool output or whole conversations. Prompts of fewer than three words are skipped, and at
+  most 300 rows a day.
+- **How:** compressed, over HTTPS, at most every six hours. On arrival each batch is encrypted
+  with a key that only our training machine holds; the receiving service cannot read it back.
+- **Used for:** grading by an AI model and training NeoSift. Nothing else.
+- **Deleting:** your install sends with a random secret id (in `~/.neocore/share/id`; we store
+  only its hash). `neocore share delete` deletes everything sent with it, including rows already
+  pulled for training, and turns sharing off.
 
 ## One memory across machines
 
@@ -199,13 +266,16 @@ Caveats, stated plainly:
 
 ## Status and limits
 
-NeoCore 0.1 is beta.
+NeoCore 0.2 is beta.
 
 - **Battle-tested scale is modest.** The assistant integration has run daily on one developer's
   Claude Code and Codex history (thousands of turns), and the engine has run behind three
   production assistants. Scale tests on large corpora are still to come.
-- **Relevance filtering is best with the optional scorer.** A free, local relevance gate is on
-  the roadmap.
+- **NeoSift needs a graphics card.** Machines without one use the hosted scorer or unfiltered
+  recall. A faster model for processors is a future training round.
+- **NeoSift has learned mostly from one developer's coding prompts so far.** On two business
+  assistants' prompts it agreed with its teacher less well (0.68 against 0.80, an earlier
+  round). Opt-in sharing is how it learns everyone's.
 - **Windows, macOS and Linux.** The daemon and hooks are developed on Windows and use only the
   standard library elsewhere. Please report issues.
 

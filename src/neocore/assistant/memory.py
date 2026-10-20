@@ -481,16 +481,18 @@ class DevMemory:
                               (thread, since))
             ]
             context = [
-                {"speaker": str(r["speaker"]), "text": str(r["content"])[:500]}
+                {"speaker": str(r["speaker"]), "text": str(r["content"])[:20_000]}
                 for r in reversed(rows("SELECT speaker,content FROM evidence WHERE thread_id=? "
                                        "ORDER BY timestamp DESC LIMIT 2", (thread,)))
             ]
+        # Whole turns: NeoSift reads the END of the reply before (a follow-up answers its last
+        # lines); Jev is sent the first 500 characters of each.
         if last is not None:  # fresher than the store, which catches up on the next sync
-            context = [{"speaker": "User", "text": last.user[:500]},
-                       {"speaker": "Assistant", "text": last.assistant[:500]}]
+            context = [{"speaker": "User", "text": last.user[:20_000]},
+                       {"speaker": "Assistant", "text": last.assistant[:20_000]}]
         budget = int(self.config.get("budget_bytes") or RECALL_BUDGET)
         pool: dict[str, Any] = {"budget_bytes": budget, "top_facts": 40}
-        inquiry = query
+        inquiry, expanded = query, False
         if self.gate.wide:
             # Only the best-scored items are injected, so recall wide from a query without
             # paths/URLs. A short follow-up ("ok do it") answers the assistant's last reply, so
@@ -509,7 +511,7 @@ class DevMemory:
                     previous = [c["text"] for c in context if c["speaker"] == "User"]
                     lead = clean_query(previous[-1])[:600] if previous else ""
                 if lead:
-                    inquiry += "\n" + lead
+                    inquiry, expanded = inquiry + "\n" + lead, True
         if not self.config.get("facts_enabled"):
             pool["top_facts"] = 0
         lap("context")
@@ -529,7 +531,7 @@ class DevMemory:
         lap("retrieve")
         from neocore.assistant import render as dev_render
         from neocore.assistant import sleep as dev_sleep
-        from neocore.assistant.filter import HOP
+        from neocore.assistant.filter import HOP, SOLO_EXTRA
 
         # Sleep's verdicts: a duplicate comes back as its fuller twin; a superseded fact brings
         # the newest fact that replaced it along ("Atlas is on b117" -> "... on b118").
@@ -596,8 +598,30 @@ class DevMemory:
         held = self._held(host, exclude_session, since)
         items = [i for i in found(result) if i["id"] not in held]
         lap("items")
+        extra = int(self.config.get("solo_extra", SOLO_EXTRA)) if expanded else 0
+        if extra > 0:
+            # The reply's opening steers a short follow-up toward the current topic and away
+            # from an older fact it asks about ("when did we set up the worker?"). The prompt's
+            # own search adds its best few: on 915 real follow-ups, 20 more items gave the
+            # scorer 23% more strong memories (score >= 0.7) for ~0.1 s.
+            from neocore.assistant.filter import clean_query
+
+            have = {i["id"] for i in items}
+            items += [i for i in found(search(clean_query(query)))
+                      if i["id"] not in have and i["id"] not in held][:extra]
+            lap("solo")
         keep, record = self.gate.select(query, context, items, host)
         lap("select")
+        if self.config.get("share") is True:
+            from neocore.assistant import share as dev_share
+
+            # Opt-in only: the prompt, what recall offered and the scores, to train NeoSift.
+            try:
+                dev_share.add(self.home, prompt=query, context=context, items=items,
+                              scores=record.get("scores"),
+                              model=self.gate.scorer if record.get("scores") else "none")
+            except (OSError, ValueError):
+                pass
         sources = self.gate.hop_sources(items, record) if keep is not None else []
         pool_items = list(items)
         if sources and sum(timing.values()) < HOP["within_ms"]:
@@ -686,6 +710,14 @@ class DevMemory:
                     dev_outcomes.jev_needed(key))
             receipt["credit"] = dev_relevance.refresh_credit(self.home, self.gate.key_file).get(
                 "credit")
+            renew()
+        if self.config.get("share") is True:
+            from neocore.assistant import share as dev_share
+
+            try:
+                receipt["share"] = dev_share.send(self.home)
+            except (OSError, ValueError) as error:
+                receipt["share"] = {"error": type(error).__name__}
             renew()
         ask = _ask(self.config)
         if ask is not None and self.config.get("facts_enabled", True):
