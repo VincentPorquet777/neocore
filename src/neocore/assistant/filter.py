@@ -296,7 +296,12 @@ def notice(home: Path, *, now: float | None = None) -> str:
     health = _health(home)
     warnings: list[tuple[str, str]] = []
     failures = int(health.get("failures") or 0)
-    if failures >= FAILURES_TO_ALERT:
+    if failures >= FAILURES_TO_ALERT and health.get("scorer") == "neosift":
+        warnings.append(("failing", (  # NeoSift fails open: memory still goes in
+            f"NeoCore memory: NeoSift, the local relevance filter, did not answer {failures} "
+            f"times in a row (last: {health.get('last_error') or 'unknown'}), so recall is going "
+            "in unfiltered. Check: neocore sift status, and ~/.neocore/sift/server.log")))
+    elif failures >= FAILURES_TO_ALERT:
         warnings.append(("failing", (
             f"NeoCore memory: the Jev relevance filter failed {failures} times in a row "
             f"(last: {health.get('last_error') or 'unknown'}), so no memory is being injected. "
@@ -343,12 +348,15 @@ class Gate:
         self._scorer = scorer
 
     def _track(self, error: str) -> None:
+        if error == "Skipped":
+            return  # NeoSift was not asked; the failed attempt before it already counted
         health = _health(self.home)
         if not error and not health.get("failures"):
             return  # the common case: nothing to write
         if error:
             health["failures"] = int(health.get("failures") or 0) + 1
             health["last_error"] = error
+            health["scorer"] = self.scorer  # the warning differs: NeoSift fails open
         else:
             health["failures"] = 0
         _save_health(self.home, health)
@@ -368,6 +376,8 @@ class Gate:
             try:
                 return neosift.scores(prompt, context, texts, kinds or ["excerpt"] * len(texts),
                                       timeout=timeout or neosift.TIMEOUT)
+            except urllib.error.HTTPError:
+                raise  # running but failing (loading, out of memory): a second one won't help
             except (ConnectionError, urllib.error.URLError):
                 neosift.ensure(self.home)  # not running yet: start it for the next prompt
                 raise

@@ -137,7 +137,8 @@ fine-tuned from [Ettin](https://huggingface.co/cross-encoder/ettin-reranker-32m-
 NeoSift gets better with more real prompts. `neocore setup` asks once:
 
 > Help improve NeoSift? If you say yes, NeoCore sends the prompts it recalls memory for, the
-> memories it offered and their scores, encrypted, to the NeoCore team. An AI model grades them
+> end of the turn before each, the memories it offered and their scores, encrypted, to the
+> NeoCore team. An AI model grades them
 > and they are used only to train NeoSift, which outputs scores and cannot reproduce text. Your
 > content is never used as knowledge, shared or sold. It is stored encrypted so future versions
 > keep learning from it. Off by default. Stop any time with `neocore share off`, or remove
@@ -145,16 +146,19 @@ NeoSift gets better with more real prompts. `neocore setup` asks once:
 
 What that means exactly (the code is [share.py](src/neocore/assistant/share.py)):
 
-- **Sent:** the prompt, the user turn and the end of the reply before it, and the memories
-  recall offered with their scores, after NeoCore's usual secret redaction. Never replies,
-  tool output or whole conversations. Prompts of fewer than three words are skipped, and at
-  most 300 rows a day.
-- **How:** compressed, over HTTPS, at most every six hours. On arrival each batch is encrypted
-  with a key that only our training machine holds; the receiving service cannot read it back.
+- **Sent:** the prompt, your previous message (first 600 characters) and the end of the
+  assistant's previous reply (last 800 characters), which is what NeoSift reads, and the
+  memories recall offered with their scores, after NeoCore's usual secret redaction. Never the
+  reply to the prompt, tool output or whole conversations. Prompts of fewer than three words
+  are skipped (nothing to learn from), and at most 300 rows a day.
+- **How:** compressed, over HTTPS, in small batches, at most every six hours. On arrival each
+  batch is encrypted with a key that only our training machine holds; the receiving service
+  cannot read it back, and it keeps a batch only until the training machine has collected it.
+  `neocore share off` also drops rows not yet sent.
 - **Used for:** grading by an AI model and training NeoSift. Nothing else.
 - **Deleting:** your install sends with a random secret id (in `~/.neocore/share/id`; we store
   only its hash). `neocore share delete` deletes everything sent with it, including rows already
-  pulled for training, and turns sharing off.
+  collected for training (within a day), turns sharing off and starts a new id.
 
 ## One memory across machines
 

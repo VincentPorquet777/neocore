@@ -5,7 +5,8 @@
     neocore share on | off | status | send | delete     (opt-in: help train NeoSift)
     neocore uninstall
     neocore doctor
-    neocore recall "QUERY" | status | stats | sync | forget ... (see ``neocore -h``)
+    neocore recall "QUERY" | status | stats | sync ...  (memory commands: ``neocore memory -h``)
+    neocore forget CONVERSATION
     neocore connect --url URL --key-file FILE [--ssh HOST --socket PATH] [--tools-only]
     neocore disconnect
     neocore server init | serve | keys | scopes | audit | export | forget  (shared memory)
@@ -190,7 +191,9 @@ def setup(args: argparse.Namespace) -> None:
         plan.append("relevance filter: " + (
             "NeoSift (installed)" if neosift.installed(home) else
             "Jev on OpenRouter (filter)" if key else
-            "none: no graphics card for NeoSift (set OPENROUTER_API_KEY for the hosted one)"))
+            "none. NeoSift skipped: no graphics card found. Recall gives its top matches "
+            "within the budget (set OPENROUTER_API_KEY and run setup again for the hosted "
+            "filter)"))
     plan.append(f"background model for facts, sleep and lessons: {llm.backend(config)}")
     if not args.no_claude:
         plan.append(f"Claude Code hooks in {_claude_settings()}")
@@ -245,7 +248,8 @@ def doctor(_: argparse.Namespace) -> None:
         "embedder": config.get("embedder_dir") or "none (lexical recall only)",
         "background model": llm.backend(config),
         "relevance filter": config.get("relevance", "off"),
-        "relevance scorer": config.get("relevance_scorer", "jev"),
+        "relevance scorer": config.get("relevance_scorer", "jev")
+        if config.get("relevance", "off") != "off" else "none",
         "neosift installed": neosift.installed(memory.HOME),
         "claude hooks": "neocore" in (_claude_settings().read_text(encoding="utf-8")
                                       if _claude_settings().exists() else ""),
@@ -272,18 +276,36 @@ def _ask_share() -> bool:
 def share_command(args: argparse.Namespace) -> None:
     config_path = memory.HOME / "config.json"
     config = memory._read_json(config_path)
-    if args.action in ("on", "off"):
-        if args.action == "on":
+    if args.action == "on":
+        if not share.enabled(config):
             print(share.NOTICE)
-        memory._write_json(config_path, {**config, "share": args.action == "on"})
-        print(f"Sharing is {args.action}.")
+        memory._write_json(config_path, {**config, "share": True})
+        print("Sharing is on. `neocore share status` shows what is waiting to be sent.")
+    elif args.action == "off":
+        memory._write_json(config_path, {**config, "share": False})
+        share.drop_queue(memory.HOME)  # rows not yet sent never leave this machine
+        print("Sharing is off. Rows not yet sent were dropped.")
     elif args.action == "status":
         print(json.dumps(share.status(memory.HOME, config), indent=1))
     elif args.action == "send":
-        print(json.dumps(share.send(memory.HOME, force=True), indent=1))
+        if not share.enabled(config):
+            sys.exit("Sharing is off (`neocore share on` to help).")
+        try:
+            print(json.dumps(share.send(memory.HOME, force=True), indent=1))
+        except OSError as error:
+            sys.exit(f"Could not reach {share.ENDPOINT} ({error}). Unsent rows are kept; "
+                     "they go with the next sync.")
     else:
         memory._write_json(config_path, {**config, "share": False})
-        print(json.dumps({**share.delete(memory.HOME), "sharing": "off"}, indent=1))
+        try:
+            answer = share.delete(memory.HOME)
+        except OSError as error:
+            sys.exit(f"Sharing is off and nothing more will be sent, but {share.ENDPOINT} "
+                     f"could not be reached ({error}), so what was already sent is not deleted "
+                     "yet. Run `neocore share delete` again later.")
+        print("Deleted: everything this install sent is removed, including copies already "
+              f"taken for training (within a day; {answer['deleted']} batches were still "
+              "waiting at the receiver). Sharing is off; turned on again, it starts a new id.")
 
 
 def sift(args: argparse.Namespace) -> None:
@@ -328,6 +350,12 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(manage.main(argv))
     own = {"setup": setup, "uninstall": uninstall, "doctor": doctor, "forget": forget,
            "sift": sift, "share": share_command}
+    if argv[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__)
+        return
+    if argv[:1] == ["memory"]:
+        memory.main(argv[1:] or ["-h"])
+        return
     if not argv or argv[0] not in own:
         memory.main(argv)  # hooks, daemon, recall, sync, status, stats ...
         return

@@ -6,7 +6,8 @@ copies this file to ``~/.neocore/sift/server.py``.
 
     POST /score {"prompt", "context": [{speaker, text}], "texts": [...], "kinds": [...]}
          -> {"scores": [P(useful) per text], "model": name}
-    GET  /health -> {"ok": true, "model": name, "device": ...}
+    GET  /health -> {"ok": true, "model": name, "device": ..., "pid": ...}
+         (503 {"ok": false, "loading": true, "pid": ...} while the model loads)
 
 It listens on 127.0.0.1 only and keeps nothing: no prompt or memory is written anywhere.
 
@@ -17,6 +18,7 @@ It listens on 127.0.0.1 only and keeps nothing: no prompt or memory is written a
 from __future__ import annotations
 
 import json
+import os
 import socketserver
 import sys
 import threading
@@ -30,6 +32,7 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 HOME = Path(__file__).resolve().parent
 MODEL_DIR = HOME / "model"
+PID_FILE = HOME / "server.pid"  # lets ``neocore sift remove`` stop exactly this process
 PORT = 8796
 IDLE_SECONDS = 8 * 3600  # the daemon starts it again on the next prompt
 
@@ -120,15 +123,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
-            self._send(200, {"ok": True, "model": SCORER.name, "device": SCORER.device})
-        else:
+        if self.path != "/health":
             self._send(404, {})
+        elif SCORER is None:
+            self._send(503, {"ok": False, "loading": True, "pid": os.getpid()})
+        else:
+            self._send(200, {"ok": True, "model": SCORER.name, "device": SCORER.device,
+                             "pid": os.getpid()})
 
     def do_POST(self) -> None:  # noqa: N802
         LAST[0] = time.time()
         try:
             request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            if SCORER is None:
+                self._send(503, {"error": "loading"})  # the daemon fails open at once
+                return
             if self.path != "/score":
                 self._send(404, {})
                 return
@@ -145,16 +154,34 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
+    # Rebinding right after an idle exit is fine on POSIX; on Windows SO_REUSEADDR would let a
+    # second server bind the same port, so there it stays off.
+    allow_reuse_address = os.name != "nt"
 
 
 def serve(port: int) -> None:
+    """Bind first, then load: a second server started by mistake exits here, before it touches
+    the graphics card."""
     global SCORER
-    SCORER = Scorer()
-    with Server(("127.0.0.1", port), Handler) as server:
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        while time.time() - LAST[0] < IDLE_SECONDS:
-            time.sleep(60)
-        server.shutdown()
+    try:
+        server = Server(("127.0.0.1", port), Handler)
+    except OSError as error:
+        print(f"port {port} is taken ({error}); another NeoSift server is running", flush=True)
+        return
+    with server:
+        PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        try:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            SCORER = Scorer()
+            while time.time() - LAST[0] < IDLE_SECONDS:
+                time.sleep(60)
+            server.shutdown()
+        finally:
+            try:
+                if PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    PID_FILE.unlink()
+            except OSError:
+                pass
 
 
 def bench() -> None:
