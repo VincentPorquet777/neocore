@@ -8,8 +8,9 @@
 shouldn't.**
 
 NeoCore gives Claude Code and Codex one shared memory of your past sessions. It can also be
-dropped into any assistant as a Python library. Recall makes **zero model calls**: it is local,
-takes milliseconds and costs nothing. Every recalled line is quoted verbatim and dated, with a
+dropped into any assistant as a Python library. Recall makes **zero LLM calls**: it is local,
+takes milliseconds and costs nothing (the optional [NeoSift](#neosift-the-local-relevance-filter)
+filter is a small local model on your graphics card, no API either). Every recalled line is quoted verbatim and dated, with a
 receipt pointing to its source. Governance (who may see what, what was revoked, what was
 corrected) is enforced at recall time, not left to the model.
 
