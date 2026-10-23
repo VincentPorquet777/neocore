@@ -266,8 +266,11 @@ Caveats, stated plainly:
   (`evals/data/*facts*`).
 - **Lenient LoCoMo judge.** Our LoCoMo judge prompt is generous about wording, like the Mem0
   protocol, but it is our own prompt.
-- **Others' figures are self-reported.** Mem0 reports 94.4% (LongMemEval) and 92.5% (LoCoMo);
-  Zep reports 94.7% on LoCoMo (75.1% when measured independently). We have not re-run them.
+- **Others' headline figures use bigger models.** Zep's 94.7% on LoCoMo uses gpt-5.4 to answer
+  and to judge; Mem0's 94.4% (LongMemEval) and 92.5% (LoCoMo) do not state their answering model or
+  judge. With the same small answering model as ours, published LoCoMo results range from 64% to
+  93%, and some systems score above NeoCore. We have not re-run them. The like-for-like comparison,
+  with sources, is in [Where NeoCore stands](https://aiforge.uk/blog/where-neocore-stands/).
 
 ## Status and limits
 
