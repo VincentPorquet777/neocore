@@ -5,6 +5,7 @@ import io
 import json
 import signal
 import subprocess
+import sys
 import urllib.error
 import zipfile
 from pathlib import Path
@@ -204,7 +205,9 @@ def test_install_checks_the_hash_and_the_speed(
     sift = tmp_path / "sift"
     assert (sift / "model/model.safetensors").read_bytes() == b"weights"
     assert (sift / "server.py").read_text(encoding="utf-8").startswith('"""NeoSift local')
-    assert any("download.pytorch.org" in " ".join(c) for c in commands)  # a CUDA torch
+    # A CUDA torch on an NVIDIA machine; macOS has no CUDA wheels, so it keeps the default one.
+    cuda_torch = any("download.pytorch.org" in " ".join(c) for c in commands)
+    assert cuda_torch == (sys.platform != "darwin")
     (sift / "venv").mkdir()
     (sift / "venv/python").write_text("")
     assert json.loads((sift / "ready.json").read_text())["name"] == neosift.NAME
