@@ -279,7 +279,7 @@ def upload_new(remote: Remote, home: Path, *, keep: Callable[[], None] | None = 
     """Send the turns added to each transcript since ``upload_offsets.json``. An offset moves
     only after the server answered for the batch ending there; a failure stops the run with the
     offsets where they were, and the next run picks up from the transcripts."""
-    from neocore.assistant.memory import transcript_sources
+    from neocore.assistant.memory import ReadGuard, transcript_sources
 
     counts: dict[str, Any] = {"captured": 0, "duplicate": 0, "rejected": 0, "skipped": 0,
                               "error": None}
@@ -316,6 +316,7 @@ def upload_new(remote: Remote, home: Path, *, keep: Callable[[], None] | None = 
             counts[status] += 1
         return True
 
+    guard = ReadGuard(home)
     for _host, root, reader in transcript_sources():
         if not root.is_dir():
             continue
@@ -326,7 +327,7 @@ def upload_new(remote: Remote, home: Path, *, keep: Callable[[], None] | None = 
             except OSError:
                 continue
             start = int(state.get(name, 0))
-            if start >= size:
+            if start >= size or guard.skip(name, start, size):
                 continue
             batch: list[dict[str, Any]] = []
             weight, reached = 0, start
@@ -339,8 +340,10 @@ def upload_new(remote: Remote, home: Path, *, keep: Callable[[], None] | None = 
                 return True
 
             for turn, after in reader(path, start):
-                sent = prepare(turn)
                 reached = after
+                if turn is None:
+                    continue  # nothing there forms a turn: only the offset moves
+                sent = prepare(turn)
                 if sent is None:
                     counts["skipped"] += 1
                 else:
@@ -357,8 +360,10 @@ def upload_new(remote: Remote, home: Path, *, keep: Callable[[], None] | None = 
                         return counts
             if reached > start and not settle(batch, reached):
                 return counts
+            guard.done(name, start, reached)
             if keep:
                 keep()
+    guard.save()
     return counts
 
 

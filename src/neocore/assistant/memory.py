@@ -205,15 +205,29 @@ def _text_blocks(content: Any, kinds: tuple[str, ...]) -> str:
     )
 
 
-def claude_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
-    """Completed turns after byte ``start``; yields each turn with the offset after it."""
+def _passed(last: int, pending: dict[str, Any] | None, whole: int) -> Iterator[tuple[None, int]]:
+    """How far a reader may move its offset without having yielded a turn: past whole lines that
+    can never form one, up to where an unfinished turn began. A chat driven only by other
+    sessions' messages, task notices or Codex heartbeats has no user prompt, and without this its
+    offset never moved: every sync re-read the same tail (223 MB, every 5 minutes, per helper)."""
+    reached = min(whole, pending["at_byte"]) if pending is not None else whole
+    if reached > last:
+        yield None, reached
+
+
+def claude_turns(path: Path, start: int) -> Iterator[tuple[Turn | None, int]]:
+    """Completed turns after byte ``start``; yields each turn with the offset after it, and last
+    ``(None, offset)`` when the lines after the last turn hold no turn yet (``_passed``)."""
 
     pending: dict[str, Any] | None = None
+    last = whole = start
     with path.open("rb") as handle:
         handle.seek(start)
         offset = start
         for raw in handle:
             line_start, offset = offset, offset + len(raw)
+            if raw.endswith(b"\n"):
+                whole = offset  # a line still being written is read again next time
             try:
                 record = json.loads(raw)
             except ValueError:
@@ -240,8 +254,9 @@ def claude_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
                     continue  # a mid-turn notice neither starts nor ends a turn
                 if pending and pending["assistant"]:
                     yield _claude_turn(pending), line_start
+                    last = line_start
                 pending = {"record": record, "user": prompt, "assistant": [], "calls": {},
-                           "actions": []}
+                           "actions": [], "at_byte": line_start}
             elif record.get("type") == "assistant" and pending is not None:
                 text = _text_blocks(content, ("text",)).strip()
                 if text:
@@ -253,7 +268,8 @@ def claude_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
                             pending["calls"][str(block.get("id") or "")] = command
                 if message.get("stop_reason") == "end_turn" and pending["assistant"]:
                     yield _claude_turn(pending), offset
-                    pending = None
+                    last, pending = offset, None
+    yield from _passed(last, pending, whole)
 
 
 TAIL_BYTES = (400_000, 4_000_000, 16_000_000)  # tool output can push the last turn far back
@@ -272,7 +288,7 @@ def last_turn(transcript: str, host: str) -> Turn | None:
             start = max(0, size - tail)  # a cut first line is skipped
             found = None
             for turn, _ in reader(path, start):
-                found = turn
+                found = turn or found
             if found or start == 0:
                 return found
     except OSError:
@@ -294,9 +310,10 @@ def _claude_turn(pending: dict[str, Any]) -> Turn:
     )
 
 
-def codex_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
+def codex_turns(path: Path, start: int) -> Iterator[tuple[Turn | None, int]]:
     meta: dict[str, Any] = {}
     pending: dict[str, Any] | None = None
+    last = whole = start
     with path.open("rb") as handle:
         first = handle.readline()
         try:
@@ -308,7 +325,9 @@ def codex_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
         handle.seek(start)
         offset = start
         for raw in handle:
-            offset += len(raw)
+            line_start, offset = offset, offset + len(raw)
+            if raw.endswith(b"\n"):
+                whole = offset
             try:
                 record = json.loads(raw)
             except ValueError:
@@ -323,7 +342,7 @@ def codex_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
                 elif role == "user" and text:
                     pending = {"user": request, "assistant": [], "at": record.get("timestamp"),
                                "id": hashlib.sha256(raw).hexdigest()[:24], "calls": {},
-                               "actions": []}
+                               "actions": [], "at_byte": line_start}
                 elif role == "assistant" and text and pending is not None:
                     pending["assistant"].append(text)
             elif (record.get("type") == "response_item" and pending is not None
@@ -348,10 +367,58 @@ def codex_turns(path: Path, start: int) -> Iterator[tuple[Turn, int]]:
                     assistant=pending["assistant"][-1],
                     actions=tuple(pending["actions"]),
                 ), offset
-                pending = None
+                last, pending = offset, None
+    yield from _passed(last, pending, whole)
 
 
-def transcript_sources() -> list[tuple[str, Path, Callable[[Path, int], Iterator[tuple[Turn, int]]]]]:
+class ReadGuard:
+    """Bounds what syncs read, whatever a reader does: a transcript whose offset did not move
+    after a read is not read again from the same offset for 5, 10, 20 ... at most 60 minutes, and
+    one sync reads at most ``SYNC_READ_BYTES``. On 2026-11-04 offsets stuck in turn-less tails
+    made 15 helpers re-read the same 223 MB every 5 minutes, ~11 TB in 3 days; with this guard
+    a stuck offset costs one read per hour. State, and the last sync's reads, in ``read_guard.json``."""
+
+    FILE = "read_guard.json"
+    FIRST_WAIT, LONGEST_WAIT = 300.0, 3600.0
+    SYNC_READ_BYTES = 256 * 1024 * 1024
+
+    def __init__(self, home: Path, now: float | None = None) -> None:
+        self.path = home / self.FILE
+        self.now = time.time() if now is None else now
+        self.state: dict[str, Any] = _read_json(self.path)
+        self.read = self.stalled = 0
+
+    def skip(self, name: str, start: int, size: int) -> bool:
+        """True when ``name`` must not be read now: it stalled at this offset and its wait is
+        not over, or this sync has used its read budget."""
+        held = self.state.get(name)
+        if isinstance(held, dict) and held.get("start") == start and self.now < held["next"]:
+            return True
+        if self.read >= self.SYNC_READ_BYTES:
+            return True
+        self.read += size - start
+        return False
+
+    def done(self, name: str, start: int, reached: int) -> None:
+        """After reading ``name`` from ``start``: forget it if the offset moved, else wait."""
+        if reached > start:
+            self.state.pop(name, None)
+            return
+        held = self.state.get(name)
+        last = float(held["wait"]) if isinstance(held, dict) and held.get("start") == start \
+            else self.FIRST_WAIT / 2
+        wait = min(self.LONGEST_WAIT, last * 2)
+        self.state[name] = {"start": start, "wait": wait, "next": self.now + wait}
+        self.stalled += 1
+
+    def save(self) -> None:
+        waiting = sum(1 for name in self.state if name != "_last_sync")
+        self.state["_last_sync"] = {"at": round(self.now), "bytes": self.read,
+                                    "stalled_files": self.stalled, "waiting_files": waiting}
+        _write_json(self.path, self.state)
+
+
+def transcript_sources() -> list[tuple[str, Path, Callable[[Path, int], Iterator[tuple[Turn | None, int]]]]]:
     """Where each host keeps its transcripts, and how to read them."""
     codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     return [
@@ -429,6 +496,7 @@ class DevMemory:
         state_path = self.home / "offsets.json"
         state = _read_json(state_path)
         counts = {"claude-code": 0, "codex": 0}
+        guard = ReadGuard(self.home)
         for host, root, reader in transcript_sources():
             if not root.is_dir():
                 continue
@@ -436,14 +504,17 @@ class DevMemory:
                 key = str(path)
                 size = path.stat().st_size
                 start = int(state.get(key, 0))
-                if start >= size:
+                if start >= size or guard.skip(key, start, size):
                     continue
                 for turn, after in reader(path, start):
-                    counts[host] += self.capture(turn)
+                    if turn is not None:
+                        counts[host] += self.capture(turn)
                     state[key] = after
+                guard.done(key, start, int(state.get(key, start)))
                 _write_json(state_path, state)
                 if keep:
                     keep()
+        guard.save()
         return counts
 
     # -- recall ----------------------------------------------------------------------------
@@ -884,12 +955,31 @@ def _release_sync(lock: Path) -> None:
         pass
 
 
+# Every chat starts its own MCP server and each one used to sync every 5 minutes: 15 chats meant
+# a sync every 20 s. ``sync.last`` is touched by every sync on this PC (Stop hooks included), and
+# a background loop only syncs when none ran for ``SYNC_EVERY`` seconds, so one per PC is enough.
+SYNC_EVERY = 300
+SYNC_STAMP = "sync.last"
+
+
+def _sync_due(home: Path | None = None, now: float | None = None) -> bool:
+    try:
+        ran = ((home or HOME) / SYNC_STAMP).stat().st_mtime
+    except OSError:
+        return True
+    return ((time.time() if now is None else now) - ran) >= SYNC_EVERY - 5  # loops drift
+
+
 def _sync(home: Path | None = None) -> dict[str, Any]:
     home = home or HOME
     lock = home / "sync.lock"
     home.mkdir(parents=True, exist_ok=True)
     if not _claim_sync(lock):
         return {"skipped": "another sync is running"}
+    try:
+        (home / SYNC_STAMP).touch()
+    except OSError:
+        pass
     try:
         memory = DevMemory(home)
 
@@ -1234,6 +1324,10 @@ def _upload() -> dict[str, Any]:
     if not _claim_sync(lock):
         return {"skipped": "another upload is running"}
     try:
+        (HOME / SYNC_STAMP).touch()
+    except OSError:
+        pass
+    try:
         return client.upload_new(remote, HOME, keep=lambda: _renew_sync(lock))
     finally:
         _release_sync(lock)
@@ -1263,13 +1357,15 @@ def mcp_server() -> None:
     def background() -> None:
         while True:
             try:
-                if remote is None:
+                if not _sync_due():
+                    pass
+                elif remote is None:
                     _sync()
                 elif remote.upload:
                     _upload()
             except Exception:
                 pass
-            time.sleep(300)
+            time.sleep(SYNC_EVERY)
 
     threading.Thread(target=background, daemon=True).start()
     if remote is not None:
