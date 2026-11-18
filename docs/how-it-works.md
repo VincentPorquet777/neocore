@@ -70,11 +70,20 @@ is your own Codex or Claude CLI sign-in.
 - **Relevance filter (optional).** With an OpenRouter key, each candidate is scored for this
   prompt and only items above the threshold are injected. Without a key, the top of the budget
   is injected.
-- **No repeats.** A chat is never sent again what it already holds.
+- **No repeats.** A chat is never sent again what it already holds: memories already
+  delivered to it (line by line, until it is compacted) and lines its prompt or last turn
+  already show word for word. A memory counts as delivered only once the hook confirms it
+  printed the text in time. A late answer is dropped, not shown.
+- **Briefing.** A chat's first message also gets a short briefing about the user: who they
+  are, how they like to work, and what they are on now. The background sync writes it from
+  the current facts (one model call, at most every few hours while facts change). Reading it
+  costs no model call. `"profile": false` in `config.json` turns it off.
 - **Stop hook.** After each reply, a background sync reads new turns from both assistants'
   transcripts. It keeps the prompts and final replies and skips tool output. Obvious secrets
   are redacted, and the turns are indexed.
-- **MCP server.** Codex also gets a `neocore_recall` tool, to search memory on demand.
+- **MCP server.** Codex also gets the memory tools: `neocore_profile`, `neocore_search`,
+  `neocore_open`, `neocore_timeline`, `neocore_facts` and `neocore_remember`. They are
+  answered by the same warm process as the prompt hook, so every chat shares one index.
 - **Provenance.** Every injected memory is labelled with date, assistant and project, for example
   `[27 Sep 2026 17:42 · Codex · my-app]`. You always know where a memory came from.
 
