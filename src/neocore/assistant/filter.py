@@ -367,15 +367,22 @@ class Gate:
         return self.mode == "filter"
 
     def _score(self, prompt: str, context: list[dict[str, str]], texts: list[str],
-               timeout: float | None = None, kinds: list[str] | None = None) -> list[float]:
+               timeout: float | None = None, kinds: list[str] | None = None,
+               bounded: bool = False) -> list[float]:
+        """Scores for ``texts``. ``bounded``: ``timeout`` is the recall's own deadline, which
+        no scorer, hedge or retry may outlast."""
         if self._scorer is not None:
+            if bounded and timeout is not None:
+                return list(first_answers([lambda: self._scorer(prompt, context, texts)],
+                                          hedges=(), deadline=timeout)[0])
             return list(self._scorer(prompt, context, texts))
         if self.scorer == "neosift":
             from neocore.assistant import neosift
 
+            limit = timeout or neosift.TIMEOUT
             try:
                 return neosift.scores(prompt, context, texts, kinds or ["excerpt"] * len(texts),
-                                      timeout=timeout or neosift.TIMEOUT)
+                                      timeout=min(limit, neosift.TIMEOUT) if bounded else limit)
             except urllib.error.HTTPError:
                 raise  # running but failing (loading, out of memory): a second one won't help
             except (ConnectionError, urllib.error.URLError):
@@ -384,6 +391,10 @@ class Gate:
         key = read_key(self.key_file)
         if not key:
             raise RuntimeError("no OpenRouter key")
+        if bounded and timeout is not None:
+            # The usual hedges, those that still fit before the deadline.
+            return score_all(prompt, context, texts, key=key, timeout=timeout,
+                             hedges=tuple(h for h in self.hedges if h < timeout))
         if timeout is not None:
             return score_all(prompt, context, texts, key=key, timeout=timeout,
                              hedges=(timeout / 2,))
@@ -401,16 +412,18 @@ class Gate:
 
     def extend(
         self, prompt: str, context: list[dict[str, str]], keep: list[dict[str, Any]],
-        more: list[dict[str, Any]], record: dict[str, Any],
+        more: list[dict[str, Any]], record: dict[str, Any], *, timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """``keep`` plus the best of ``more``, the memories the second search found. A failed
-        scoring leaves ``keep`` as it was."""
+        scoring leaves ``keep`` as it was. ``timeout``: what the recall's deadline leaves."""
         started = time.perf_counter()
         second: dict[str, Any] = {"found": len(more), "kept": 0}
         record["second"] = second
         try:
             scores = self._score(prompt, context, [i["text"] for i in more],
-                                 timeout=float(HOP["timeout"]), kinds=[i["kind"] for i in more])
+                                 timeout=float(HOP["timeout"]) if timeout is None
+                                 else min(float(HOP["timeout"]), timeout),
+                                 kinds=[i["kind"] for i in more], bounded=timeout is not None)
             if len(scores) != len(more):
                 raise ValueError("score count")
         except _SCORING_ERRORS as error:
@@ -433,9 +446,11 @@ class Gate:
         return merged
 
     def select(
-        self, prompt: str, context: list[dict[str, str]], items: list[dict[str, Any]], host: str
+        self, prompt: str, context: list[dict[str, str]], items: list[dict[str, Any]], host: str,
+        *, timeout: float | None = None,
     ) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
-        """Items to inject, best first (``None``: inject unchanged), and the log record."""
+        """Items to inject, best first (``None``: inject unchanged), and the log record.
+        ``timeout``: the most scoring may take (what the recall's deadline leaves)."""
         record: dict[str, Any] = {
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "host": host,
             "mode": self.mode, "facts": sum(i["kind"] == "fact" for i in items),
@@ -447,7 +462,8 @@ class Gate:
         started = time.perf_counter()
         try:
             scores = self._score(prompt, context, [i["text"] for i in items],
-                                 kinds=[i["kind"] for i in items])
+                                 timeout=None if timeout is None else min(self.timeout, timeout),
+                                 kinds=[i["kind"] for i in items], bounded=timeout is not None)
             if len(scores) != len(items):
                 raise ValueError("score count")
         except _SCORING_ERRORS as error:

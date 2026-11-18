@@ -430,3 +430,80 @@ def test_the_real_pins_are_full_sha256_digests() -> None:
     assert len(cli.EMBEDDER_FILES) == 3
     assert all(len(d) == 64 and int(d, 16) >= 0 for d in cli.EMBEDDER_FILES.values())
 
+
+
+# -- briefing and delivery receipts -----------------------------------------------------------
+
+
+def test_a_server_holds_a_recall_only_once_its_key_confirms_it(rig: Rig, tmp_path: Path) -> None:
+    key, other = rig.issue("laptop"), rig.issue("desktop")
+    rig.capture(key, _turn("s1", "t1", "Which port does the zebra gateway use?",
+                           "The zebra gateway listens on port 8791."))
+    ask = {"exclude_session": "chat", "protocol": 2}
+    reply = rig.recall(key, "zebra gateway port", **ask)
+    receipt = reply["receipt"]
+    assert "8791" in reply["text"] and set(receipt) == {
+        "request_id", "text_sha256", "ack_grace_seconds"}
+    assert receipt["text_sha256"] == hashlib.sha256(reply["text"].encode()).hexdigest()
+    assert "8791" in rig.recall(key, "zebra gateway port", **ask)["text"]  # not confirmed
+
+    def ack(by: str, receipt: dict[str, Any], digest: str = "") -> bool:
+        status, body = rig.call(by, "POST", "/v1/ack", {
+            "request_id": receipt["request_id"],
+            "text_sha256": digest or receipt["text_sha256"]})
+        assert status == 200
+        return bool(body["acked"])
+
+    receipt = rig.recall(key, "zebra gateway port", **ask)["receipt"]
+    assert not ack(other, receipt) and not ack(key, receipt, "0" * 64)
+    assert rig.call(key, "POST", "/v1/ack", {"request_id": 1})[0] == 400
+    assert ack(key, receipt)
+    assert rig.recall(key, "zebra gateway port", **ask)["text"] == ""
+    # The client side: ``ask(ack=True)`` then ``acknowledge`` once printed.
+    key_file = tmp_path / "laptop.key"
+    keys.write_key_file(key_file, key)
+    remote = client.Remote(url=f"http://127.0.0.1:{rig.port}", key_file=str(key_file))
+    home = tmp_path / "dev"
+    answer = client.ask(remote, home, "zebra gateway port", "chat2", "claude-code",
+                        since="", ack=True)
+    assert "8791" in answer["text"] and answer["receipt"]["request_id"]
+    assert client.acknowledge(answer, home)
+    again = client.ask(remote, home, "zebra gateway port", "chat2", "claude-code",
+                       since="", ack=True)
+    assert again["text"] == ""
+    audit = (rig.home / "audit.jsonl").read_text(encoding="utf-8")
+    assert '"acked": true' in audit and "8791" not in audit
+
+
+def test_a_server_briefs_each_key_from_its_own_scopes(rig: Rig) -> None:
+    from neocore.assistant.render import PROFILE_HEAD
+
+    key, al = rig.issue(), rig.issue("al-pc", ("al",), "al")
+    rig.capture(key, _turn("s1", "t1", "Which port does the zebra gateway use?",
+                           "The zebra gateway listens on port 8791."))
+    (rig.home / "profile.json").write_text(json.dumps({"internal": {
+        "text": "Alex runs the zebra gateway.", "built": time.time()}}), encoding="utf-8")
+    status, listed = rig.call(key, "POST", "/mcp",
+                              {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert listed["result"]["tools"][0]["name"] == "neocore_profile"
+    text, error = rig.tool(key, "neocore_profile")
+    assert not error and text == PROFILE_HEAD + "Alex runs the zebra gateway."
+    assert rig.tool(al, "neocore_profile")[0].startswith("No briefing yet")
+    first = rig.recall(key, "zebra gateway port", exclude_session="chat")["text"]
+    assert first.index("Alex runs the zebra") < first.index("8791")
+    assert "Alex runs" not in rig.recall(key, "zebra gateway port again",
+                                         exclude_session="chat")["text"]
+    assert "Alex runs" not in rig.recall(al, "zebra gateway port", exclude_session="c2")["text"]
+
+
+def test_the_server_sync_briefs_every_scope_set_in_use(rig: Rig) -> None:
+    from neocore.shared.server import Background
+
+    background = Background(rig.service)
+    assert background.profile_scopes() == [frozenset({"internal"})]
+    rig.issue("a", ("al",), "al")
+    rig.issue("b", ("bea", "al"), "al")
+    rig.issue("c", ("al",), "al")
+    gone, _ = rig.service.keys.issue("d", "alex", read_scopes=("old",), write_scope="old")
+    rig.service.keys.revoke(gone)
+    assert background.profile_scopes() == [frozenset({"al"}), frozenset({"al", "bea"})]

@@ -281,36 +281,57 @@ def test_only_one_warm_daemon_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert started == [True] and not tmp_path.joinpath("serve.lock").exists()
 
 
-@pytest.mark.parametrize("daemon", [None, "echo:xero"])
-def test_mcp_lists_and_calls_recall(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, daemon: str | None
+@pytest.mark.parametrize("daemon", [False, True])
+def test_mcp_offers_every_memory_tool_without_a_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, daemon: bool
 ) -> None:
-    # With a warm daemon the answer comes from it; without one, from an in-process copy.
+    # With a warm daemon the answer comes from it (one loaded index for every chat); when none
+    # can start, from an in-process copy.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _jsonl(tmp_path / ".claude/projects/p/a.jsonl",
+           _claude("s1", "u1", "The Acme CRM Xero sync runs nightly at 2am.", "Ok."))
+    home = tmp_path / "dev"
+    memory = DevMemory(home)
+    memory.ingest()
+    memory.maintain()
+    monkeypatch.setattr(dev_memory, "HOME", home)
     monkeypatch.setattr(dev_memory, "_sync", lambda *a, **k: {})
-    monkeypatch.setattr(dev_memory, "_ask_daemon",
-                        lambda *a: None if daemon is None else {"text": daemon, "notice": ""})
     monkeypatch.setattr(dev_memory, "_detached", lambda *a: None)
-    monkeypatch.setattr(dev_memory.DevMemory, "recall", lambda self, q, **k: f"echo:{q}")
-    monkeypatch.setattr(dev_memory.DevMemory, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setattr(dev_memory, "DAEMON_WAIT", 0.0)
+    called: list[str] = []
+    if daemon:
+        monkeypatch.setattr(dev_memory, "_tool_daemon", lambda name, arguments: called.append(
+            name) or {"text": f"daemon:{name}", "is_error": False})
+    else:
+        monkeypatch.setattr(dev_memory, "_tool_daemon", lambda name, arguments: None)
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "x"}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "neocore_recall", "arguments": {"query": "xero"}},
-        },
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "neocore_recall", "arguments": {"query": "xero sync"}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+         "params": {"name": "neocore_profile", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+         "params": {"name": "neocore_search", "arguments": {}}},
     ]
     monkeypatch.setattr("sys.stdin", io.StringIO("".join(json.dumps(r) + "\n" for r in requests)))
     out = io.StringIO()
     monkeypatch.setattr("sys.stdout", out)
     dev_memory.mcp_server()
     replies = [json.loads(line) for line in out.getvalue().splitlines()]
-    assert [r["id"] for r in replies] == [1, 2, 3]
-    assert replies[1]["result"]["tools"][0]["name"] == "neocore_recall"
-    assert replies[2]["result"]["content"][0]["text"] == "echo:xero"
+    assert [r["id"] for r in replies] == [1, 2, 3, 4, 5]
+    names = [t["name"] for t in replies[1]["result"]["tools"]]
+    assert names == ["neocore_profile", "neocore_search", "neocore_open", "neocore_timeline",
+                     "neocore_facts", "neocore_remember"]
+    texts = [r["result"]["content"][0]["text"] for r in replies[2:]]
+    if daemon:  # the 0.2 tool name still works: a search
+        assert texts == ["daemon:neocore_search", "daemon:neocore_profile",
+                         "daemon:neocore_search"] and called
+        return
+    assert "nightly at 2am" in texts[0]
+    assert texts[1].startswith("No briefing yet")
+    assert replies[4]["result"]["isError"] and "query" in texts[2]
 
 
 def test_codex_prompt_hook_asks_as_codex(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -447,7 +468,9 @@ def test_a_replaced_memory_arrives_marked_with_what_replaced_it(
     (tmp_path / "dev/config.json").write_text(json.dumps(config))
 
     def extract(request: dict[str, Any]) -> list[dict[str, Any]]:
-        return [{"text": e["text"], "source_evidence_ids": [e["evidence_id"]]}
+        # Worded unlike the reply: a fact that repeats a line word for word replaces it.
+        return [{"text": e["text"].replace("LoCoMo", "The LoCoMo benchmark"),
+                 "source_evidence_ids": [e["evidence_id"]]}
                 for e in request["evidence"] if e["speaker"] == "assistant"]
 
     _model(monkeypatch, extract)
@@ -1476,3 +1499,352 @@ def test_a_scorer_bug_is_raised_at_once_not_retried_like_a_network_error() -> No
     with pytest.raises(ZeroDivisionError):
         first_answers([lambda: [0.5], broken], hedges=(0.5, 1.0), deadline=3)
     assert sent == [1] and clock.monotonic() - started < 0.5
+
+
+# -- briefing, exact copies, delivery receipts, deadlines -------------------------------------
+
+
+def test_broken_characters_are_repaired_and_only_exact_copies_count() -> None:
+    from neocore.assistant.render import normalize_request, novelty, span_hash
+
+    assert normalize_request("a😀b\ud800") == ("a\U0001f600b�", 1)
+    assert normalize_request("plain") == ("plain", 0)
+    resident = ["Recap: the Atlas backup runs at 4am.  Anything else?"]
+    assert novelty("The  Atlas backup runs at 4am.", resident)[0]
+    # A copy whose numbers or negations differ, or a word inside another word, is not a copy.
+    assert not novelty("The Atlas backup runs at 5am.", resident)[0]
+    assert not novelty("deploy on Friday", ["never deploy on Friday"])[0]
+    assert not novelty("allowed", ["disallowed"])[0]
+    # Near copies are only measured (logged), never dropped.
+    exact, overlap = novelty("the Atlas backup runs at 4am every night", resident)
+    assert not exact and overlap > 0
+    assert span_hash("a  b") == span_hash("a b") != span_hash("a c")
+
+
+def _one_fact_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                     config: dict[str, Any] | None = None) -> tuple[DevMemory, list[str]]:
+    """A memory of one turn; its model writes facts and a briefing, and logs its prompts."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _jsonl(tmp_path / ".claude/projects/p/a.jsonl",
+           _claude("s1", "u1", "The Acme CRM Xero sync runs nightly at 2am.", "Ok."))
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev/config.json").write_text(json.dumps(config or {}))
+    asked: list[str] = []
+
+    def ask(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        asked.append(prompt)
+        return {"profile": "Alex runs Acme CRM and its Xero sync."} if "briefing" in prompt else {}
+
+    monkeypatch.setattr(dev_memory, "_ask", lambda config: ask)
+    monkeypatch.setattr(dev_memory, "_fact_extractor", lambda ask: lambda request: [
+        {"text": "Alex's Acme CRM Xero sync runs nightly at 2am.",
+         "source_evidence_ids": [e["evidence_id"]]}
+        for e in request["evidence"] if e["speaker"] == "user"])
+    memory = DevMemory(tmp_path / "dev")
+    memory.ingest()
+    memory.maintain()
+    return memory, asked
+
+
+def test_the_briefing_is_built_in_the_sync_and_only_when_due(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from neocore.assistant import profile as dev_profile
+
+    memory, asked = _one_fact_memory(tmp_path, monkeypatch)
+    home = tmp_path / "dev"
+    assert dev_profile.get(home, {"internal"}) == "Alex runs Acme CRM and its Xero sync."
+    assert dev_profile.get(home, {"internal", "other"}) == ""  # one briefing per scope set
+    briefings = sum("briefing" in p for p in asked)
+    assert briefings == 1 and "Acme CRM Xero sync" in asked[-1]
+    memory.maintain()  # fresh: no model call
+    assert sum("briefing" in p for p in asked) == briefings
+    newest = "9999"
+    assert not dev_profile.due(home, {"internal"}, "")
+    assert dev_profile.due(home, {"internal"}, newest, now=time.time() + 5 * 3600)
+    assert dev_profile.due(home, {"internal"}, "", now=time.time() + 21 * 3600)
+    # A scope that may read none of the facts gets no briefing, and costs no call.
+    rows = memory.store.rows
+    assert dev_profile.build(rows, home, lambda p, s: {"profile": "x"}, {"other"}) == {
+        "scopes": "other", "skipped": "no facts"}
+
+
+def test_a_chats_first_message_gets_the_briefing_once_and_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from neocore.assistant.render import PROFILE_HEAD
+
+    memory, _ = _one_fact_memory(tmp_path, monkeypatch)
+    first = memory.recall("when does the Xero sync run?", exclude_session="s9",
+                          host="claude-code")
+    assert PROFILE_HEAD in first and "Alex runs Acme CRM" in first
+    assert first.index("Alex runs Acme CRM") < first.index("nightly at 2am")
+    again = memory.recall("and the Acme CRM invoices sync?", exclude_session="s9",
+                          host="claude-code")
+    assert "Alex runs Acme CRM" not in again  # the chat holds it
+    later = Turn("claude-code", "s8", "t", "", "2026-09-20T10:00:00Z", "hi", "hello")
+    assert "Alex runs Acme CRM" not in memory.recall(
+        "when does the Xero sync run?", exclude_session="s8", host="claude-code", last=later)
+    record = json.loads((tmp_path / "dev/recall_log.jsonl").read_text().splitlines()[0])
+    assert record["profile"] > 0 and record["delivery"] == "rendered"
+
+
+def test_a_briefing_can_be_turned_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from neocore.assistant import profile as dev_profile
+
+    memory, asked = _one_fact_memory(tmp_path, monkeypatch, {"profile": False})
+    assert not any("briefing" in p for p in asked)
+    assert dev_profile.get(tmp_path / "dev", {"internal"}) == ""
+    assert "About the user" not in memory.recall("when does the Xero sync run?",
+                                                 exclude_session="s9", host="claude-code")
+
+
+def test_the_profile_tool_reads_the_briefing_for_the_callers_scopes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from neocore.shared.tools import Tools
+
+    memory, _ = _one_fact_memory(tmp_path, monkeypatch)
+    tools = Tools(memory)
+    text = tools.call("neocore_profile", {}, scopes=frozenset({"internal"}),
+                      write_scope="internal", device="pc")
+    assert text.startswith("About the user") and "Alex runs Acme CRM" in text
+    assert tools.call("neocore_profile", {}, scopes=frozenset({"other"}), write_scope="other",
+                      device="pc").startswith("No briefing yet")
+
+
+def test_a_line_the_chat_already_shows_is_not_sent_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for gate in (True, False):
+        home = tmp_path / str(gate)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        _jsonl(home / ".claude/projects/p/a.jsonl", _claude(
+            "s1", "u1", "The Acme CRM Xero sync runs nightly at 2am.\n"
+                        "The Acme CRM backup runs at 4am.", "Ok."))
+        (home / "dev").mkdir()
+        (home / "dev/config.json").write_text(json.dumps(
+            {"facts_enabled": False, "exact_copy_gate": gate}))
+        memory = DevMemory(home / "dev")
+        memory.ingest()
+        memory.maintain()
+        pasted = "The Acme CRM Xero sync runs nightly at 2am. Is that still right for Acme CRM?"
+        text = memory.recall(pasted, exclude_session="s9", host="claude-code")
+        assert "backup runs at 4am" in text
+        assert ("Xero sync runs nightly at 2am" in text) is not gate
+
+
+def test_a_chat_holds_the_lines_it_was_shown_and_gets_only_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from neocore.assistant.render import span_hash
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _jsonl(tmp_path / ".claude/projects/p/a.jsonl", _claude(
+        "s1", "u1", "The Acme CRM Xero sync runs nightly at 2am.\n"
+                    "The Acme CRM backup runs at 4am.", "Ok."))
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev/config.json").write_text(json.dumps({"facts_enabled": False}))
+    memory = DevMemory(tmp_path / "dev")
+    memory.ingest()
+    memory.maintain()
+    # The chat already received the Xero line (from another turn that repeated it).
+    memory.hold("claude-code", "s9", "", set(),
+                {span_hash("The Acme CRM Xero sync runs nightly at 2am.")[:20]})
+    receipt: dict[str, Any] = {}
+    text = memory.recall("when do the Acme CRM jobs run?", exclude_session="s9",
+                         host="claude-code", protocol=2, request_id="r1", receipt=receipt)
+    assert "backup runs at 4am" in text and "Xero sync" not in text
+    assert memory.acknowledge("r1", receipt["text_sha256"])
+    held = json.loads((tmp_path / "dev/held.json").read_text())["claude-code:s9"]
+    assert len(held["span_hashes"]) >= 2 and held["ids"]
+    assert memory.recall("when do the Acme CRM jobs run?", exclude_session="s9",
+                         host="claude-code", protocol=2, request_id="r2") == ""
+
+
+def test_a_chat_holds_a_memory_only_once_the_host_confirms_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _jsonl(tmp_path / ".claude/projects/p/a.jsonl",
+           _claude("s1", "u1", "The Acme CRM Xero sync runs nightly at 2am.", "Ok."))
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev/config.json").write_text(json.dumps({"facts_enabled": False}))
+    memory = DevMemory(tmp_path / "dev")
+    memory.ingest()
+    memory.maintain()
+    ask: dict[str, Any] = {"exclude_session": "s9", "host": "claude-code", "protocol": 2}
+
+    def recall(request_id: str, **extra: Any) -> tuple[str, dict[str, Any]]:
+        receipt: dict[str, Any] = {}
+        text = memory.recall("when does the Acme CRM Xero sync run?", request_id=request_id,
+                             receipt=receipt, **{**ask, **extra})
+        return text, receipt
+
+    text, receipt = recall("r1", owner="key-a")
+    assert "nightly" in text and receipt["text_sha256"] == hashlib.sha256(
+        text.encode()).hexdigest() and receipt["rendered_ids"]
+    # Not confirmed: the next prompt gets it again.
+    text, receipt = recall("r2", owner="key-a")
+    assert "nightly" in text
+    assert not memory.acknowledge("r2", "0" * 64, key_id="key-a")  # another text
+    assert not memory.acknowledge("r2", receipt["text_sha256"], key_id="key-b")  # another key
+    assert not memory.acknowledge("nope", receipt["text_sha256"], key_id="key-a")
+    assert memory.acknowledge("r2", receipt["text_sha256"], key_id="key-a")
+    assert memory.acknowledge("r2", receipt["text_sha256"], key_id="key-a")  # idempotent
+    assert recall("r3", owner="key-a")[0] == ""
+    # A confirmation after its grace is refused.
+    text, receipt = recall("r4", exclude_session="s7",
+                           deadline=dev_memory.RecallDeadline(time.monotonic() + 5))
+    memory._deliveries["r4"]["expires"] = time.monotonic() - 1
+    assert not memory.acknowledge("r4", receipt["text_sha256"])
+    # With receipts off, what is rendered counts at once.
+    (tmp_path / "dev/config.json").write_text(json.dumps(
+        {"facts_enabled": False, "delivery_receipts": False}))
+    memory = DevMemory(tmp_path / "dev")
+    assert "nightly" in recall("r5", exclude_session="s6")[0]
+    assert recall("r6", exclude_session="s6")[0] == ""
+
+
+def test_a_recall_past_its_deadline_raises_instead_of_answering_late(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _jsonl(tmp_path / ".claude/projects/p/a.jsonl",
+           _claude("s1", "u1", "The Acme CRM Xero sync runs nightly at 2am.", "Ok."))
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev/config.json").write_text(json.dumps({"facts_enabled": False}))
+    memory = DevMemory(tmp_path / "dev")
+    memory.ingest()
+    memory.maintain()
+    engine = type(memory.recall_engine)
+    original = engine.recall
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(1.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "recall", slow)  # the search copy uses it too
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        memory.recall("when does the Acme CRM Xero sync run?", exclude_session="s9",
+                      host="claude-code",
+                      deadline=dev_memory.RecallDeadline(time.monotonic() + 0.5, 0.1))
+    assert time.monotonic() - started < 0.9
+    assert not (tmp_path / "dev/held.json").exists()
+    time.sleep(0.7)  # the abandoned search finishes on its own copy
+    (tmp_path / "dev/config.json").write_text(json.dumps(
+        {"facts_enabled": False, "recall_deadlines": False}))
+    memory = DevMemory(tmp_path / "dev")
+    assert "nightly" in memory.recall(
+        "when does the Acme CRM Xero sync run?", exclude_session="s9", host="claude-code",
+        deadline=dev_memory.RecallDeadline(time.monotonic() + 0.5, 0.1))
+
+
+def test_the_hook_repairs_the_prompt_confirms_what_it_printed_and_drops_a_late_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dev_memory, "HOME", tmp_path)
+    monkeypatch.setattr(dev_memory, "_detached", lambda *a: None)
+    asked: list[tuple[str, dict[str, Any]]] = []
+    acked: list[dict[str, Any]] = []
+    answer = {"text": "<m/>", "notice": "", "receipt": {"request_id": "r"}}
+
+    def ask_daemon(query: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        asked.append((query, kwargs))
+        return dict(answer)
+
+    monkeypatch.setattr(dev_memory, "_ask_daemon", ask_daemon)
+    monkeypatch.setattr(dev_memory, "_ack_daemon", lambda a: acked.append(a) or True)
+
+    def prompt(text: str) -> str:
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+            {"prompt": text, "session_id": "s"})))
+        out = io.StringIO()
+        monkeypatch.setattr("sys.stdout", out)
+        dev_memory.claude_prompt_hook()
+        return out.getvalue()
+
+    shown = prompt("when does the Acme CRM Xero sync run? \ud83d")
+    assert json.loads(shown)["hookSpecificOutput"]["additionalContext"] == "<m/>"
+    query, kwargs = asked[-1]
+    assert query.endswith("�") and kwargs["unicode_replacements"] == 1
+    assert kwargs["protocol"] == 2 and len(acked) == 1
+    answer["_deadline"] = time.monotonic() - 0.1  # answered after the hook's deadline
+    assert prompt("when does the Acme CRM Xero sync run?") == "" and len(acked) == 1
+    # Receipts off: the daemon counts what it renders; nothing to confirm.
+    (tmp_path / "config.json").write_text(json.dumps({"delivery_receipts": False}))
+    del answer["_deadline"]
+    prompt("when does the Acme CRM Xero sync run?")
+    assert asked[-1][1]["protocol"] == 1
+
+
+def test_a_chats_first_message_asks_even_when_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dev_memory, "HOME", tmp_path)
+    monkeypatch.setattr(dev_memory, "_detached", lambda *a: None)
+    asked: list[str] = []
+    monkeypatch.setattr(dev_memory, "_ask_daemon", lambda q, *a, **k: asked.append(q) or {
+        "text": "", "notice": ""})
+    transcript = tmp_path / "t.jsonl"
+
+    def prompt(text: str) -> None:
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+            {"prompt": text, "session_id": "s", "transcript_path": str(transcript)})))
+        dev_memory.claude_prompt_hook()
+
+    prompt("hi there")  # no transcript yet: the chat's first message
+    assert asked == ["hi there"]
+    _jsonl(transcript, _claude("s", "u1", "hi there", "Hello."))
+    prompt("ok thanks")
+    assert asked == ["hi there"]
+
+
+def test_the_warm_daemon_answers_tool_calls_and_confirmations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory, _ = _one_fact_memory(tmp_path, monkeypatch)
+    owner = dev_memory._Owner(memory, dev_memory._Compactions())
+    try:
+        reply = owner.tool({"name": "neocore_profile", "arguments": {}})
+        assert not reply["is_error"] and "Alex runs Acme CRM" in reply["text"]
+        found = owner.tool({"name": "neocore_search", "arguments": {"query": "Xero sync"}})
+        assert "nightly at 2am" in found["text"]
+        assert owner.tool({"name": "neocore_search", "arguments": {}})["is_error"]
+        assert owner.tool({"name": "nope", "arguments": {}})["is_error"]
+        noted = owner.tool({"name": "neocore_remember",
+                            "arguments": {"text": "The Atlas staging box is atlas-stg-2."}})
+        assert "Remembered" in noted["text"]
+        assert "atlas-stg-2" in owner.tool(
+            {"name": "neocore_search", "arguments": {"query": "Atlas staging box"}})["text"]
+        answer = owner.recall({"query": "when does the Acme CRM Xero sync run?",
+                               "exclude_session": "s9", "host": "claude-code",
+                               "deadline": time.time() + 10, "request_id": "r1",
+                               "protocol": 2})
+        assert "nightly" in answer["text"] and answer["receipt"]["request_id"] == "r1"
+        assert memory.acknowledge("r1", answer["receipt"]["text_sha256"])
+        late = owner.recall({"query": "Xero sync", "deadline": time.time() - 1})
+        assert late["error"] == "late"
+    finally:
+        owner.stop()
+
+
+def test_a_turn_compacted_out_of_the_window_no_longer_counts_as_shown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _jsonl(tmp_path / ".claude/projects/p/a.jsonl",
+           _claude("s1", "u1", "The Acme CRM Xero sync runs nightly at 2am.", "Ok."))
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev/config.json").write_text(json.dumps({"facts_enabled": False}))
+    memory = DevMemory(tmp_path / "dev")
+    memory.ingest()
+    memory.maintain()
+    last = Turn("hermes", "h1", "", "", "", "The Acme CRM Xero sync runs nightly at 2am.", "Ok.")
+    ask = {"exclude_session": "h1", "host": "hermes", "last": last}
+    assert "nightly" not in memory.recall("when does the Acme CRM Xero sync run?", **ask)
+    compacted = {**ask, "since": "2099-01-01T00:00:00"}
+    assert "nightly" in memory.recall("when does the Acme CRM Xero sync run?", **compacted)

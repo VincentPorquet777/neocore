@@ -8,7 +8,10 @@ Every endpoint takes ``Authorization: Bearer <key>`` (``neocore.shared.keys``):
 
     GET  /v1/health    liveness; with a valid key also version and counts
     POST /v1/recall    {query, host, exclude_session, since, last_turn?, deadline_epoch,
-                        sent_epoch?} -> {state, text, error?}
+                        sent_epoch?, request_id?, protocol?} -> {state, text, receipt?, error?}
+    POST /v1/ack       {request_id, text_sha256} -> {state, acked}: the device printed the
+                       answer of a ``protocol: 2`` recall; only then does its chat hold what
+                       it showed (an older device's answer counts once sent in time)
     POST /v1/capture   {turns: [Turn]} -> {results: [{turn_id, status}]}, status being
                        captured | duplicate | rejected (200 turns / 4 MB per request)
     POST /mcp          MCP over streamable HTTP (JSON replies): ``neocore.shared.tools``
@@ -25,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import socket
 import socketserver
@@ -32,6 +36,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
@@ -42,6 +47,7 @@ from typing import Any
 from neocore.assistant.memory import (
     SCOPE,
     DevMemory,
+    RecallDeadline,
     Turn,
     _claim_daemon,
     _claim_sync,
@@ -58,6 +64,7 @@ MAX_WAIT_SECONDS = 30.0  # no recall is given longer than this, whatever the cli
 AUDIT_BYTES = 5_000_000
 CONNECTIONS = 64
 HOSTS = ("claude-code", "codex", "hermes")
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _LIMITS = {"session_id": 200, "turn_id": 200, "project": 1000, "occurred_at": 64}
 _TEXT_LIMIT = 500_000
 _ACTIONS_LIMIT = 50
@@ -98,7 +105,9 @@ def _bad(message: str, status: int = 400) -> Reply:
 
 class Recaller:
     """Prompt recalls, one at a time on one warm memory, each within its asker's deadline. What a
-    recall showed counts as held by that chat only when the answer went back in time."""
+    recall showed counts as held by that chat once the device confirms it printed it
+    (``protocol: 2``, ``/v1/ack``), or, for a device that does not confirm, once the answer went
+    back in time."""
 
     def __init__(self, memory: DevMemory) -> None:
         self.memory = memory
@@ -110,34 +119,51 @@ class Recaller:
         lock = threading.Lock()
         abandoned = [False]
         memory = self.memory
+        confirms = (request.get("protocol") == 2
+                    and memory.config.get("delivery_receipts", True) is not False)
+        reserve = float(memory.config.get("recall_return_reserve_seconds", 0.25))
 
-        def job() -> str | None:
+        def job() -> tuple[str, dict[str, Any]] | None:
             self.waiting -= 1
             if time.monotonic() >= end:
                 return None  # its asker has gone; recalling now would only delay the next one
             delivered: set[str] = set()
-            text = memory.recall(
-                request["query"], exclude_session=request["exclude_session"],
-                host=request["host"], since=request["since"], last=request["last"],
-                scopes=request["scopes"], delivered=delivered)
+            receipt: dict[str, Any] = {}
+            try:
+                text = memory.recall(
+                    request["query"], exclude_session=request["exclude_session"],
+                    host=request["host"], since=request["since"], last=request["last"],
+                    scopes=request["scopes"], delivered=None if confirms else delivered,
+                    deadline=RecallDeadline(end, min(reserve, wait / 4)),
+                    request_id=request.get("request_id", ""), receipt=receipt,
+                    protocol=2 if confirms else 1, owner=request.get("owner", ""),
+                    timing=request.get("timing"))
+            except TimeoutError:
+                return None
             with lock:
                 if abandoned[0]:
                     return None
-                memory.hold(request["host"], request["exclude_session"], request["since"],
-                            delivered)
-                return text
+                if not confirms:
+                    memory.hold(request["host"], request["exclude_session"], request["since"],
+                                delivered)
+                return text, receipt
 
         self.waiting += 1
         future = self.pool.submit(job)
         try:
-            text = future.result(timeout=max(0.0, end - time.monotonic()))
-        except FutureTimeout:
+            done = future.result(timeout=max(0.0, end - time.monotonic()))
+        except (FutureTimeout, TimeoutError):
             with lock:
                 abandoned[0] = True
             return {"state": "deadline", "text": "", "error": "late"}
-        if text is None:
+        if done is None:
             return {"state": "deadline", "text": "", "error": "late"}
-        return {"state": "ok" if text else "empty", "text": text}
+        text, receipt = done
+        reply: dict[str, Any] = {"state": "ok" if text else "empty", "text": text}
+        if confirms:
+            reply["receipt"] = {k: receipt[k] for k in
+                                ("request_id", "text_sha256", "ack_grace_seconds") if k in receipt}
+        return reply
 
     def stop(self) -> None:
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -186,7 +212,7 @@ class MemoryService:
             name = route[len(API) + 1:]
         else:
             return _bad("not found", 404)
-        if name not in ("health", "recall", "capture", "mcp"):
+        if name not in ("health", "recall", "ack", "capture", "mcp"):
             return _bad("not found", 404)
         if (name == "health") != (method == "GET"):
             return Reply(405, {"error": "method not allowed"},
@@ -219,6 +245,8 @@ class MemoryService:
                 reply = _bad("body must be a JSON object")
             elif name == "recall":
                 reply = self.recall(key, body)
+            elif name == "ack":
+                reply = self.ack(key, body)
             else:
                 reply = self.capture(key, body)
         except Exception as error:
@@ -229,7 +257,7 @@ class MemoryService:
         self.audit({"endpoint": name, **who, "status": reply.status,
                     "ms": round((time.monotonic() - started) * 1000),
                     **{k: v for k, v in shown.items()
-                       if k in ("state", "captured", "duplicate", "rejected")},
+                       if k in ("state", "captured", "duplicate", "rejected", "acked")},
                     **({"error": shown["error"]} if isinstance(shown.get("error"), str) else {}),
                     **({"tool": reply.headers.pop("X-Tool")}
                        if reply.headers and "X-Tool" in reply.headers else {})})
@@ -272,11 +300,29 @@ class MemoryService:
         wait = deadline - (sent if isinstance(sent, (int, float)) else time.time())
         last = body.get("last_turn")
         turn = _parse_turn(last, require_reply=False) if isinstance(last, dict) else None
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not _REQUEST_ID.match(request_id):
+            request_id = uuid.uuid4().hex
+        sent_timing = body.get("timing") if isinstance(body.get("timing"), dict) else {}
+        timing = {k[:40]: int(v) for k, v in list(sent_timing.items())[:20]
+                  if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        replaced = body.get("unicode_replacements")
+        if isinstance(replaced, int) and not isinstance(replaced, bool):
+            timing["unicode_replacements"] = max(0, replaced)
         return Reply(200, self.recaller.ask({
             "query": query, "host": host, "exclude_session": exclude, "since": since,
-            "last": turn,
+            "last": turn, "request_id": request_id, "timing": timing,
+            "protocol": 2 if body.get("protocol") == 2 else 1,
             "scopes": tuple(key.read_scopes),  # from the key, never from the request
+            "owner": key.key_id,  # the only key that may confirm the delivery
         }, max(0.0, min(MAX_WAIT_SECONDS, float(wait)))))
+
+    def ack(self, key: KeyInfo, body: dict[str, Any]) -> Reply:
+        request_id, digest = body.get("request_id"), body.get("text_sha256")
+        if not isinstance(request_id, str) or not isinstance(digest, str):
+            return _bad("request_id and text_sha256 are required")
+        acked = self.memory.acknowledge(request_id[:64], digest[:64], key_id=key.key_id)
+        return Reply(200, {"state": "ok" if acked else "deadline", "acked": acked})
 
     def capture(self, key: KeyInfo, body: dict[str, Any]) -> Reply:
         turns = body.get("turns")
@@ -520,9 +566,16 @@ class Background:
         if not _claim_sync(lock):
             return {"skipped": "another sync is running"}
         try:
-            return self.service.writer.maintain(lambda: _renew_sync(lock))
+            return self.service.writer.maintain(lambda: _renew_sync(lock),
+                                                profile_scopes=self.profile_scopes())
         finally:
             _release_sync(lock)
+
+    def profile_scopes(self) -> list[frozenset[str]]:
+        """One briefing per distinct set of read scopes among the keys in use."""
+        sets = {frozenset(entry.get("read_scopes") or ())
+                for entry in self.service.keys.listing() if not entry.get("revoked_at")}
+        return sorted((s for s in sets if s), key=sorted) or [frozenset({SCOPE})]
 
     def _maintain(self) -> None:
         last = 0.0

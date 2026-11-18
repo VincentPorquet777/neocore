@@ -1,4 +1,4 @@
-"""Memory tools an AI calls on purpose: search, open, timeline, facts, remember.
+"""Memory tools an AI calls on purpose: profile, search, open, timeline, facts, remember.
 
 The prompt hook feeds memory in automatically; these let the AI look things up with intent ("what
 did we decide about pricing in September?", "show me that whole turn"). Every read is limited to
@@ -307,6 +307,14 @@ class Tools:
                          f"{' · ' + label if label else ''} — {facts[f]['text']}")
         return "\n".join(lines)
 
+    def profile(self, args: dict[str, Any], scopes: frozenset[str]) -> str:
+        """The user's briefing for exactly the caller's scopes (``neocore.assistant.profile``)."""
+        from neocore.assistant import profile as dev_profile
+
+        text = dev_profile.get(self.memory.home, scopes)
+        return (dev_render.PROFILE_HEAD + text if text
+                else "No briefing yet: the next sync writes it from the memory's facts.")
+
     def remember(self, args: dict[str, Any], *, write_scope: str, device: str) -> str:
         """Store a note the user asked to keep: a turn (the record) plus a fact citing it, found
         at once, before background indexing catches up."""
@@ -340,8 +348,9 @@ class Tools:
             raise ToolError("arguments must be an object")
         if name == "neocore_remember":
             return self.remember(args, write_scope=write_scope, device=device)
-        reads = {"neocore_search": self.search, "neocore_open": self.open,
-                 "neocore_timeline": self.timeline, "neocore_facts": self.facts}
+        reads = {"neocore_profile": self.profile, "neocore_search": self.search,
+                 "neocore_open": self.open, "neocore_timeline": self.timeline,
+                 "neocore_facts": self.facts}
         if name not in reads:
             raise ToolError(f"unknown tool {name}")
         with self.lock:
@@ -357,6 +366,13 @@ _FILTERS: dict[str, Any] = {
 }
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "neocore_profile",
+        "description": (
+            "Who the user is, how they like to work and what they are working on now: a short "
+            "briefing kept current from their memory. Read it at the start of a conversation."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
     {
         "name": "neocore_search",
         "description": (
