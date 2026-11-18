@@ -7,8 +7,10 @@
 **Long-term memory for AI assistants that recalls only what the moment needs, and never what it
 shouldn't.**
 
-NeoCore gives Claude Code and Codex one shared memory of your past sessions. It can also be
-dropped into any assistant as a Python library. Recall makes **zero LLM calls**: it is local,
+NeoCore gives every AI harness you use one memory: Claude Code, Codex and Hermes read and write
+the same memory of everything you told them, on all your machines. Tell Codex something at your
+desk; Hermes knows it on Telegram tonight. It can also be dropped into any assistant as a Python
+library. Recall makes **zero LLM calls**: it is local,
 takes milliseconds and costs nothing (the optional [NeoSift](#neosift-the-local-relevance-filter)
 filter is a small local model on your graphics card, no API either). Every recalled line is quoted verbatim and dated, with a
 receipt pointing to its source. Governance (who may see what, what was revoked, what was
@@ -46,13 +48,16 @@ that what you recall is still true, and you know what you were told in confidenc
 - **Exact and traceable.** Excerpts are verbatim slices of what was said. Their offsets point
   into the stored message. Relative dates are resolved (`last Friday [= 19 May 2023]`) and
   clearly marked as NeoCore's note, not speech.
-- **Shared between assistants.** What you decided with Claude Code on Monday is there for Codex
-  on Tuesday, and the other way round.
+- **One memory, every harness.** What you decided with Claude Code on Monday is there for Codex
+  and Hermes on Tuesday, and the other way round. Every item says which AI and project it came
+  from.
+- **Knows you from the first message.** A new chat starts with a short briefing built from your
+  facts: who you are, how you like to work, what you are working on.
 
 ## Quick start: Claude Code and Codex
 
 ```bash
-pipx install "neocore-memory[embed] @ git+https://github.com/VincentPorquet777/neocore"
+pipx install "neocore-memory[embed]"
 neocore setup
 ```
 
@@ -70,7 +75,9 @@ the hooks and keeps your memory. `neocore doctor` checks the install. Run
 After setup:
 
 - **Every prompt** gets the memory that matters, as hook context, in well under a second. A warm
-  local daemon serves it.
+  local daemon serves it. A chat's first prompt also gets your briefing.
+- **Memory tools** for the AI to look further on purpose: `neocore_search`, `neocore_open`,
+  `neocore_timeline`, `neocore_facts`, `neocore_profile` and `neocore_remember`.
 - **Every finished reply** starts a background sync. It reads new turns from Claude Code and
   Codex transcripts (prompts and final replies only; tool output is skipped and obvious secrets
   are redacted) and indexes them.
@@ -229,10 +236,11 @@ hermes plugins install VincentPorquet777/neocore/integrations/hermes
 hermes memory setup          # pick "neocore"
 ```
 
-Each turn is kept verbatim in the profile, and dated excerpts are recalled before the next turns
-with zero model calls. By default each messaging chat keeps its own memory. The agent also gets
-`neocore_search` and `neocore_forget` tools. Settings, what is stored and the one-time model
-download are described in [integrations/hermes](integrations/hermes/README.md).
+Your own Hermes conversations (the CLI, the desktop app, and your own direct messages) join the
+same memory as Claude Code and Codex: this machine's after `neocore setup`, or your memory
+server after `neocore connect`. Hermes gets the same memory tools. Groups, and anyone else who
+messages your agent, keep a separate memory per chat and never see yours. Settings, what is
+stored and the one-time downloads are described in [integrations/hermes](integrations/hermes/README.md).
 
 ## Quick start: any assistant
 
@@ -327,7 +335,7 @@ Caveats, stated plainly:
 
 ## Status and limits
 
-NeoCore 0.2 is beta.
+NeoCore 0.3 is beta.
 
 - **Battle-tested scale is modest.** The assistant integration has run daily on one developer's
   Claude Code and Codex history (thousands of turns), and the engine has run behind three

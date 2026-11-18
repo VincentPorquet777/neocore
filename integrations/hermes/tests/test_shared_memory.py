@@ -158,7 +158,7 @@ def test_the_same_tools_as_claude_code_and_codex(machine):
     found = provider.handle_tool_call("neocore_search", {"query": "atlas deploy codeword"})
     assert "PELICAN-42" in found
     stored = provider.handle_tool_call("neocore_remember",
-                                       {"text": "Vincent's dentist is Dr Okafor on Bold Street."})
+                                       {"text": "Alex's dentist is Dr Okafor on Bold Street."})
     assert stored.startswith("Remembered")
     manager.shutdown_all()
     memory = DevMemory(machine["neocore"])

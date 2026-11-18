@@ -39,7 +39,7 @@ Recall works in four steps.
    **receipt** lists every delivered excerpt (evidence id and character offsets) and every fact
    with its sources.
 
-On LoCoMo, recall takes a median of 22 ms on a laptop CPU, with no network and no model calls.
+On LoCoMo, recall takes a median of 22 ms on a laptop, with no network and no model calls.
 
 ## 3. Grow: facts, sleep, lessons (background)
 

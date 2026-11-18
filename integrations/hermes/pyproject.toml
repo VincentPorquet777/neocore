@@ -1,9 +1,9 @@
 [project]
 name = "hermes-plugin-neocore"
-version = "0.1.0"
+version = "0.3.0"
 description = "Hermes Agent memory provider plugin: NeoCore"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 # Installed into the Hermes environment by `hermes plugins install` / `enable`. The embed extra
 # (numpy, onnxruntime, tokenizers) lets recall match meaning, not only words.
-dependencies = ["neocore-memory[embed]>=0.2.0,<0.3"]
+dependencies = ["neocore-memory[embed]>=0.3.0,<0.4"]
