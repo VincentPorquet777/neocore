@@ -1,6 +1,6 @@
 name: neocore
 version: 0.2.0
-description: "NeoCore — governed long-term memory: verbatim, dated recall before each turn with zero model calls, filtered by NeoSift (its own local relevance model) on a graphics card; each messaging chat keeps its own memory by default."
+description: "NeoCore — one memory for every AI harness you use: your Hermes conversations share the memory Claude Code and Codex use (on this machine or your own memory server). Verbatim, dated recall before each turn with zero model calls, filtered by NeoSift on a graphics card; groups and other people keep their own memory."
 requires_hermes: ">=0.22.2"
 # Dependencies: pyproject.toml next to this file (Hermes's package manager reads it).
 requires_env: []
