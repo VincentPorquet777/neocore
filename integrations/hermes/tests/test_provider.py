@@ -82,7 +82,7 @@ def test_each_messaging_chat_keeps_its_own_memory(home):
 
 def test_profile_scope_shares_everything(home):
     (home / plugin.DATA_DIR / "config.json").write_text(
-        json.dumps({"dense_recall": False, "scope": "profile"}))
+        json.dumps({"dense_recall": False, "scope": "profile", "shared": "off"}))
     manager, provider = start(home, "a1", platform="telegram", gateway_session_key="tg:dm:1")
     turn(manager, provider, "The boiler service is booked for the 14th.", "Great.", session="a1")
     manager.shutdown_all()

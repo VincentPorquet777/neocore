@@ -10,10 +10,15 @@ from typing import Any
 import pytest
 
 from neocore import llm
+from neocore.assistant import memory as dev_memory
 
 
 @pytest.fixture(autouse=True)
 def _no_real_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A detached `neocore sync` or `serve` is a new process this guard does not reach: it would
+    # find the CLI and spend real calls after the test is over. Tests that check the spawn
+    # replace this with their own stand-in.
+    monkeypatch.setattr(dev_memory, "_detached", lambda *args: None)
     monkeypatch.setattr(llm, "backend",
                         lambda config: str((config or {}).get("llm") or "none"))
     real_asker = llm.asker
