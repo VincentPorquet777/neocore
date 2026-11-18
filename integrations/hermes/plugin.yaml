@@ -1,0 +1,6 @@
+name: neocore
+version: 0.1.0
+description: "NeoCore — governed long-term memory: verbatim, dated recall before each turn with zero model calls; each messaging chat keeps its own memory by default."
+requires_hermes: ">=0.22.2"
+# Dependencies: pyproject.toml next to this file (Hermes's package manager reads it).
+requires_env: []

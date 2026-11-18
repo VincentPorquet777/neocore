@@ -181,6 +181,21 @@ is away: a device's transcripts are its queue. Admin commands (`neocore server s
 Linux, macOS and Windows are in `scripts/install/`. Full guide:
 [docs/shared-memory.md](docs/shared-memory.md).
 
+## Quick start: Hermes Agent
+
+NeoCore is a memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+(0.22.2 or newer):
+
+```bash
+hermes plugins install VincentPorquet777/neocore/integrations/hermes
+hermes memory setup          # pick "neocore"
+```
+
+Each turn is kept verbatim in the profile, and dated excerpts are recalled before the next turns
+with zero model calls. By default each messaging chat keeps its own memory. The agent also gets
+`neocore_search` and `neocore_forget` tools. Settings, what is stored and the one-time model
+download are described in [integrations/hermes](integrations/hermes/README.md).
+
 ## Quick start: any assistant
 
 ```python
