@@ -3,6 +3,7 @@
     neocore setup [--dry-run] [--no-embedder] [--no-sift] [--no-claude] [--no-codex]
     neocore sift install [--force] | remove | status   (NeoSift, the local relevance filter)
     neocore share on | off | status | send | delete     (opt-in: help train NeoSift)
+    neocore rules add | remove | list | check | build | stats | off | on   (``neocore rules -h``)
     neocore uninstall
     neocore doctor
     neocore recall "QUERY" | status | stats | sync ...  (memory commands: ``neocore memory -h``)
@@ -14,6 +15,10 @@
 Setup only edits what it names: ``~/.claude/settings.json`` (two hooks, merged, a backup kept)
 and ``~/.codex/config.toml`` (an MCP server and two hooks inside marked lines). Codex asks you
 to trust new hooks the first time they run; NeoCore never marks them trusted for you.
+
+Rules check (``neocore rules``): its hooks are installed only while you have rules, and only the
+ones your rules need. ``neocore rules add/remove/build`` bring them up to date on every host
+NeoCore is set up on; with no rules there are no rules hooks at all.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from neocore import llm
-from neocore.assistant import memory, neosift, share
+from neocore.assistant import memory, neosift, rules, share
 
 EMBEDDER = "bge-small-en-v1.5-onnx-Q"
 EMBEDDER_URL = "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/main/"
@@ -41,6 +46,8 @@ EMBEDDER_FILES = {
     "config.json": "13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd",
 }
 BEGIN, END = "# >>> neocore >>>", "# <<< neocore <<<"
+RULES_BEGIN, RULES_END = "# >>> neocore rules >>>", "# <<< neocore rules <<<"
+RULES_MODULE = "neocore.assistant.rules"
 
 
 def _python() -> str:
@@ -55,8 +62,14 @@ def _codex_config() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
 
 
+def _is_rules_hook(hook: dict[str, Any]) -> bool:
+    return RULES_MODULE in str(hook.get("command") or "")
+
+
 def _is_ours(hook: dict[str, Any]) -> bool:
-    return "neocore" in str(hook.get("command") or "") and "-hook" in str(hook.get("command"))
+    """One of the memory hooks (the rules check's hooks are managed apart)."""
+    command = str(hook.get("command") or "")
+    return "neocore" in command and "-hook" in command and not _is_rules_hook(hook)
 
 
 def claude_hooks(settings: dict[str, Any]) -> dict[str, Any]:
@@ -80,15 +93,42 @@ def claude_hooks(settings: dict[str, Any]) -> dict[str, Any]:
     return {**settings, "hooks": hooks}
 
 
-def without_claude_hooks(settings: dict[str, Any]) -> dict[str, Any]:
+def without_claude_hooks(settings: dict[str, Any], *, memory_hooks: bool = True,
+                         rule_hooks: bool = True) -> dict[str, Any]:
+    """``settings`` without NeoCore's hooks (by default both the memory and the rules hooks)."""
+    def drop(hook: dict[str, Any]) -> bool:
+        return (memory_hooks and _is_ours(hook)) or (rule_hooks and _is_rules_hook(hook))
+
     hooks = dict(settings.get("hooks") or {})
     for event in list(hooks):
-        groups = [{**g, "hooks": [h for h in g.get("hooks", []) if not _is_ours(h)]}
+        groups = [{**g, "hooks": [h for h in g.get("hooks", []) if not drop(h)]}
                   for g in hooks[event]]
         hooks[event] = [g for g in groups if g["hooks"]]
         if not hooks[event]:
             del hooks[event]
     return {**settings, "hooks": hooks}
+
+
+def claude_rule_hooks(settings: dict[str, Any], plan: dict[str, str | None]) -> dict[str, Any]:
+    """``settings`` with the rules check's hooks for ``plan`` ({event: tool matcher}); an empty
+    plan (no rules) removes them all."""
+    python = f'"{_python()}" -m {RULES_MODULE}'
+    out = without_claude_hooks(settings, memory_hooks=False)
+    hooks = dict(out.get("hooks") or {})
+    for event, matcher in plan.items():
+        group: dict[str, Any] = {"hooks": [{
+            "type": "command", "timeout": 5,
+            "command": f"{python} {rules.HOOK_EVENT_TO_CHECK[event]} --host claude-code"}]}
+        if matcher:
+            group = {"matcher": matcher, **group}
+        hooks[event] = list(hooks.get(event, [])) + [group]
+    return {**out, "hooks": hooks}
+
+
+def _has_claude_hooks(settings: dict[str, Any]) -> bool:
+    return any(_is_ours(h) or _is_rules_hook(h)
+               for groups in (settings.get("hooks") or {}).values()
+               for g in groups for h in g.get("hooks", []))
 
 
 def codex_block() -> str:
@@ -118,12 +158,79 @@ def codex_block() -> str:
     ]) + "\n"
 
 
-def without_codex_block(text: str) -> str:
-    if BEGIN not in text:
+def without_codex_block(text: str, begin: str = BEGIN, end: str = END) -> str:
+    if begin not in text:
         return text
-    head, rest = text.split(BEGIN, 1)
-    tail = rest.split(END, 1)[1] if END in rest else ""
+    head, rest = text.split(begin, 1)
+    tail = rest.split(end, 1)[1] if end in rest else ""
     return head.rstrip("\n") + "\n" + tail.lstrip("\n")
+
+
+def codex_rules_block(plan: dict[str, str | None]) -> str:
+    """The rules check's Codex hooks inside their own marked lines ("" for an empty plan)."""
+    if not plan:
+        return ""
+    python = _python()
+    run = f"& '{python}' -m {RULES_MODULE}" if os.name == "nt" else f"'{python}' -m {RULES_MODULE}"
+    lines = [RULES_BEGIN,
+             "# NeoCore rules check (`neocore rules`): zero model calls, present only while you",
+             "# have rules. `neocore rules off` pauses it; `neocore uninstall` removes this block."]
+    for event, matcher in plan.items():
+        lines += ["", f"[[hooks.{event}]]"]
+        if matcher:
+            lines.append(f"matcher = {json.dumps(matcher)}")
+        lines += [f"[[hooks.{event}.hooks]]", 'type = "command"',
+                  f'command = "{run} {rules.HOOK_EVENT_TO_CHECK[event]} --host codex"',
+                  "timeout = 5"]
+    return "\n".join(lines + [RULES_END]) + "\n"
+
+
+def with_codex_rules(text: str, plan: dict[str, str | None]) -> str:
+    """``text`` with the rules block for ``plan`` (none for an empty plan)."""
+    text = without_codex_block(text, RULES_BEGIN, RULES_END)
+    block = codex_rules_block(plan)
+    return text.rstrip("\n") + "\n\n" + block if block else text
+
+
+def _rule_plans() -> dict[str, dict[str, str | None]]:
+    live = rules.load_rules(rules.rules_home() / rules.RULES_FILE, verified_only=True)
+    return {host: rules.hook_plan(live, host) for host in rules.HOSTS}
+
+
+def _neocore_set_up() -> bool:
+    claude, codex = _claude_settings(), _codex_config()
+    return ((claude.exists() and _has_claude_hooks(json.loads(claude.read_text(encoding="utf-8"))))
+            or (codex.exists() and BEGIN in codex.read_text(encoding="utf-8")))
+
+
+def refresh_rule_hooks() -> list[str]:
+    """Bring the rules check's hooks in line with the rules, on every host NeoCore is already set
+    up on (never on one it is not). Returns the files changed."""
+    plans = _rule_plans()
+    changed = []
+    path = _claude_settings()
+    if path.exists():
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        if _has_claude_hooks(settings):
+            new = claude_rule_hooks(settings, plans["claude-code"])
+            if new != settings:
+                _backup(path)
+                path.write_text(json.dumps(new, indent=2) + "\n", encoding="utf-8")
+                changed.append(str(path))
+    path = _codex_config()
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        if BEGIN in text or RULES_BEGIN in text:
+            new_text = with_codex_rules(text, plans["codex"])
+            if new_text != text:
+                _backup(path)
+                path.write_text(new_text, encoding="utf-8")
+                changed.append(str(path))
+    for name in changed:
+        print(f"  rules hooks updated in {name}")
+    if not changed and any(plans.values()) and not _neocore_set_up():
+        print("  run `neocore setup` to install the hooks that check these rules")
+    return changed
 
 
 def _backup(path: Path) -> None:
@@ -160,19 +267,21 @@ def _download_embedder(target: Path, opener: Any = None) -> str:
 
 def install_hooks(*, claude: bool, codex: bool) -> None:
     """Add (or refresh) NeoCore's hooks and MCP server; earlier files are backed up first."""
+    plans = _rule_plans()
     if claude:
         path = _claude_settings()
         path.parent.mkdir(parents=True, exist_ok=True)
         current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         _backup(path)
-        path.write_text(json.dumps(claude_hooks(current), indent=2) + "\n", encoding="utf-8")
+        new = claude_rule_hooks(claude_hooks(current), plans["claude-code"])
+        path.write_text(json.dumps(new, indent=2) + "\n", encoding="utf-8")
     if codex:
         path = _codex_config()
         path.parent.mkdir(parents=True, exist_ok=True)
         text = path.read_text(encoding="utf-8") if path.exists() else ""
         _backup(path)
-        path.write_text(without_codex_block(text).rstrip("\n") + "\n\n" + codex_block(),
-                        encoding="utf-8")
+        text = without_codex_block(text).rstrip("\n") + "\n\n" + codex_block()
+        path.write_text(with_codex_rules(text, plans["codex"]), encoding="utf-8")
 
 
 def setup(args: argparse.Namespace) -> None:
@@ -199,6 +308,12 @@ def setup(args: argparse.Namespace) -> None:
         plan.append(f"Claude Code hooks in {_claude_settings()}")
     if not args.no_codex:
         plan.append(f"Codex MCP server and hooks in {_codex_config()}")
+    plans = _rule_plans()
+    if any(plans.values()):
+        plan.append("rules check hooks: " + "; ".join(
+            f"{host} {', '.join(events)}" for host, events in plans.items() if events))
+    else:
+        plan.append("rules check: no rules, so no hooks (`neocore rules add` to start)")
     print("NeoCore setup:\n  " + "\n  ".join(plan))
     if args.dry_run:
         return
@@ -236,12 +351,15 @@ def uninstall(_: argparse.Namespace) -> None:
                         encoding="utf-8")
     path = _codex_config()
     if path.exists():
-        path.write_text(without_codex_block(path.read_text(encoding="utf-8")), encoding="utf-8")
+        text = without_codex_block(path.read_text(encoding="utf-8"))
+        path.write_text(without_codex_block(text, RULES_BEGIN, RULES_END), encoding="utf-8")
     print(f"Hooks removed. Your memory is still in {memory.HOME}; delete that folder to erase it.")
 
 
 def doctor(_: argparse.Namespace) -> None:
     config = memory._read_json(memory.HOME / "config.json")
+    claude = _claude_settings().read_text(encoding="utf-8") if _claude_settings().exists() else ""
+    codex = _codex_config().read_text(encoding="utf-8") if _codex_config().exists() else ""
     checks = {
         "memory folder": str(memory.HOME),
         "config": bool(config),
@@ -256,6 +374,9 @@ def doctor(_: argparse.Namespace) -> None:
         "codex block": BEGIN in (_codex_config().read_text(encoding="utf-8")
                                  if _codex_config().exists() else ""),
         "daemon running": bool(memory._read_json(memory.HOME / "daemon.json")),
+        "rules check": {**rules.summary(),
+                        "claude-code hooks installed": RULES_MODULE in claude,
+                        "codex hooks installed": RULES_BEGIN in codex},
     }
     print(json.dumps(checks, indent=1))
 
@@ -356,6 +477,8 @@ def main(argv: list[str] | None = None) -> None:
     if argv[:1] == ["memory"]:
         memory.main(argv[1:] or ["-h"])
         return
+    if argv[:1] == ["rules"]:
+        sys.exit(rules.manage(argv[1:] or ["-h"], on_change=refresh_rule_hooks))
     if not argv or argv[0] not in own:
         memory.main(argv)  # hooks, daemon, recall, sync, status, stats ...
         return

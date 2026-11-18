@@ -96,6 +96,44 @@ neocore sift status       # NeoSift: installed, graphics card, in use
 neocore share status      # opt-in sharing: on/off, rows waiting and sent
 ```
 
+## Rules check: your standing rules, at the moment of action
+
+Recall finds what a prompt is about. A rule such as "never force-push" has to hold when nobody
+mentions it, so the rules check looks at what the AI is about to do instead: a tool call about to
+run, or the reply about to end its turn. It makes no model calls; each check is a few regular
+expressions with a 2-second limit, and any error lets the AI carry on.
+
+```bash
+# hold a matching shell command once, with your words, so the AI checks it against the rule
+neocore rules add no-force-push --statement "Never force-push; open a pull request instead." \
+  --tool @shell --input 'git\s+push\b.*--force'
+# send a reply back once if it breaks the rule
+neocore rules add ticket --statement "End every reply with the ticket number, like [T-123]." \
+  --require '\[T-\d+\]\s*$'
+# list it at every session start
+neocore rules add spelling --statement "Use British spelling." --standing
+
+neocore rules list        # every rule and whether it is live
+neocore rules check --tool Bash --input "git push --force origin main"   # dry run
+neocore rules stats       # how often each rule fired, and what the AI did next
+neocore rules off         # pause it (no settings change); `neocore rules on` to resume
+```
+
+- **Hold once** (`--tool`/`--input`): the first matching tool call in a turn is stopped with the
+  rule and your words; if it still fits the rule, the AI runs it again and it goes through.
+  `--mode note` lets it run with the rule as a reminder instead (Claude Code). Tool families:
+  `@shell`, `@write`, `@agent`, `@browser_builtin`, `@browser_chrome`.
+- **Send back once** (`--forbid`, `--require`, `--max-words`, `--max-items`, with `--when` and
+  `--unless`): at most once per turn of yours, never in a loop.
+- **No rules, no hooks.** `neocore setup` adds the rules hooks only while you have rules, and only
+  the events they need; `neocore rules add`, `remove` and `build` keep them in line on every host
+  NeoCore is set up on. `neocore uninstall` removes them with the others.
+
+Rules live in `~/.neocore/rules/rules.source.json`; edit it by hand and run `neocore rules build`.
+Only records `build` stamped ever fire. A rule can quote you from a transcript
+(`--words "..." --source FILE --line N`, or `owner_source` in the file); the build refuses it
+unless your words are on that line word for word. Every firing is logged locally in `~/.neocore/rules/log.jsonl`.
+
 ## NeoSift: the local relevance filter
 
 Recall finds candidates by words and meaning, but many of them only share words with the
