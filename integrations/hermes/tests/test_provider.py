@@ -29,7 +29,8 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("NEOCORE_HOME", str(tmp_path / "neocore-home"))  # never the machine's own
     folder = tmp_path / plugin.DATA_DIR
     folder.mkdir()
-    (folder / "config.json").write_text(json.dumps({"dense_recall": False}))
+    # These tests are about Hermes's own memory; the shared memory has its own tests below.
+    (folder / "config.json").write_text(json.dumps({"dense_recall": False, "shared": "off"}))
     return tmp_path
 
 
@@ -162,7 +163,7 @@ def test_config_round_trip(home):
     provider.save_config({"scope": "user", "budget_chars": "12000", "junk": 1}, str(home))
     config = plugin.load_config(home / plugin.DATA_DIR)
     assert config == {"scope": "user", "budget_chars": 12000, "dense_recall": False,
-                      "neosift": "auto"}
+                      "neosift": "auto", "shared": "off", "owners": ""}
 
 
 # -- NeoSift (a stand-in scorer: the real one needs a graphics card) ----------------------------
@@ -237,7 +238,7 @@ def test_neosift_reads_the_last_turn(home):
 def test_neosift_off_is_never_asked(home):
     remember(home)
     (home / plugin.DATA_DIR / "config.json").write_text(
-        json.dumps({"dense_recall": False, "neosift": "off"}))
+        json.dumps({"dense_recall": False, "neosift": "off", "shared": "off"}))
     asked = []
     manager, provider = start_sifted(home, lambda p, c, t: asked.append(1) or [0.0] * len(t), "s2")
     assert "Feedzai" in provider.prefetch("Where do I work in Lisbon? Feedzai", session_id="s2")

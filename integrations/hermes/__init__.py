@@ -1,6 +1,12 @@
 """NeoCore memory provider for Hermes Agent.
 
-Every finished turn is kept verbatim in one SQLite file inside the profile's home. Before each turn
+The owner's own conversations (the CLI, the desktop app, and direct messages from the ids in
+``owners``) join the machine's NeoCore memory: the same one Claude Code and Codex use after
+``neocore setup``, or the memory server this machine is connected to (``neocore connect``). What
+the owner tells any of them, Hermes knows, and the other way round. Every other conversation (a
+group, someone else's direct messages) keeps a memory of its own and never sees the owner's.
+
+Every finished turn is kept verbatim in one SQLite file. Before each turn
 NeoCore recalls the dated excerpts that turn needs, with zero model calls (BM25, plus a small local
 embedding model once it is downloaded). On a machine with a graphics card (NVIDIA, or Apple
 silicon) NeoSift, NeoCore's own relevance model, then reads the turn and the recalled memories
@@ -38,8 +44,11 @@ DATA_DIR = "neocore"  # inside the profile's HERMES_HOME
 EMBEDDER = "bge-small-en-v1.5-onnx-Q"
 SCOPES = ("auto", "profile", "chat", "user")
 SIFT_MODES = ("auto", "off")
+SHARE_MODES = ("auto", "off")
 DEFAULTS: dict[str, Any] = {"scope": "auto", "budget_chars": 8000, "dense_recall": True,
-                            "neosift": "auto"}
+                            "neosift": "auto", "shared": "auto", "owners": ""}
+HOST = "hermes"  # how the shared memory names Hermes's turns, next to claude-code and codex
+SPAWN_SYNC = True  # tests turn the detached background sync off
 # NeoSift scores a wide pool and keeps the best: recall this many excerpts for it to read.
 SIFT_POOL: dict[str, Any] = {"top_spans": 48, "top_facts": 0, "budget_bytes": 40_000,
                              "focus_turns": 2}
@@ -49,6 +58,14 @@ SYSTEM_NOTE = (
     "NeoCore long-term memory is on. Before a turn, dated excerpts from earlier conversations "
     "may appear in a memory block. To look further back, call neocore_search. Call neocore_forget "
     "only when the person asks you to forget something."
+)
+SHARED_NOTE = (
+    "NeoCore memory is on: one memory shared by every AI harness this person uses (Claude Code, "
+    "Codex, Hermes, ...), on all their machines. Before a turn, dated items from it may appear "
+    "in a memory block, each saying which AI and project it came from. To look further, call "
+    "neocore_search; neocore_open reads one item in full, neocore_timeline shows what they "
+    "worked on when, neocore_facts lists current facts. Call neocore_remember only when the "
+    "person asks you to remember something."
 )
 # Recalled context Hermes fenced into a message is not something the person said: never store it.
 _FENCED = re.compile(r"<memory-context>.*?</memory-context>", re.S | re.I)
@@ -116,7 +133,30 @@ def load_config(folder: Path) -> dict[str, Any]:
     config["neosift"] = str(config["neosift"]).lower()
     if config["neosift"] not in SIFT_MODES:
         config["neosift"] = DEFAULTS["neosift"]
+    config["shared"] = str(config["shared"]).lower()
+    if config["shared"] not in SHARE_MODES:
+        config["shared"] = DEFAULTS["shared"]
+    config["owners"] = str(config["owners"] or "")
     return config
+
+
+def owns(config: dict[str, Any], context: dict[str, Any]) -> bool:
+    """Whether this conversation is the owner's own, and so joins the shared memory: the CLI,
+    the desktop app or an API call (no messaging chat), everything with ``scope: profile`` (one
+    person), and direct messages from an id listed in ``owners`` (``123``, or ``telegram:123``).
+    A group or channel never does, whoever writes in it."""
+    if config["shared"] != "auto":
+        return False
+    if config["scope"] == "profile":
+        return True
+    if not (context.get("gateway_session_key") or context.get("chat_id")):
+        return True
+    if str(context.get("chat_type") or "dm") != "dm":
+        return False
+    owners = {o.strip() for o in config["owners"].split(",") if o.strip()}
+    platform = str(context.get("platform") or "")
+    ids = {str(context.get(k) or "") for k in ("user_id", "user_id_alt")} - {""}
+    return any(i in owners or f"{platform}:{i}" in owners for i in ids)
 
 
 def sift_home() -> Path:
@@ -126,6 +166,79 @@ def sift_home() -> Path:
 
 _SIFT_LOCK = threading.Lock()
 _SIFT_BUSY: set[str] = set()
+
+
+class SharedMemory:
+    """The machine's NeoCore memory (``home``, normally ``~/.neocore``), or the memory server
+    it is connected to. One per process: a gateway opens a provider per chat."""
+
+    def __init__(self, home: Path) -> None:
+        from neocore.shared import client
+
+        self.home = home
+        self.remote = client.load(home)
+        self.lock = threading.RLock()
+        self._memory: Any = None
+        self._tools: Any = None
+        self._synced = 0.0
+
+    @property
+    def local(self) -> bool:
+        return self.remote is None
+
+    def memory(self) -> Any:
+        with self.lock:
+            if self._memory is None:
+                from neocore.assistant.memory import DevMemory
+
+                self._memory = DevMemory(self.home)
+            return self._memory
+
+    def tools(self) -> Any:
+        with self.lock:
+            if self._tools is None:
+                from neocore.shared.tools import Tools
+
+                self._tools = Tools(self.memory(), write_lock=self.lock)
+            return self._tools
+
+    def reload(self) -> None:
+        """Read the settings again next time (NeoSift or the embedder were just installed)."""
+        with self.lock:
+            if self._memory is not None:
+                self._memory.store.close()
+            self._memory = self._tools = None
+
+    def sync_soon(self) -> None:
+        """What a Claude Code or Codex stop hook does: a detached ``sync`` (index, facts, sleep,
+        and this machine's Claude Code and Codex transcripts), at most once per ``SYNC_EVERY``."""
+        from neocore.assistant import memory as dev
+
+        if not SPAWN_SYNC or time.time() - self._synced < dev.SYNC_EVERY:
+            return
+        if dev._sync_due(self.home):
+            self._synced = time.time()
+            dev._detached("sync")
+
+
+_SHARED: dict[str, SharedMemory] = {}
+
+
+def shared_memory(home: Path) -> SharedMemory:
+    key = str(home.resolve())
+    with _EMBEDDERS_LOCK:
+        if key not in _SHARED:
+            home.mkdir(parents=True, exist_ok=True)
+            from neocore.assistant import memory as dev
+            from neocore.shared import client
+
+            if client.load(home) is None and not (home / "config.json").exists():
+                # Hermes is the first NeoCore on this machine: the settings `neocore setup`
+                # writes, so Claude Code or Codex set up later join this memory as it is.
+                dev._write_json(home / "config.json",
+                                {"budget_bytes": 8000, "facts_enabled": True, "relevance": "off"})
+            _SHARED[key] = SharedMemory(home)
+        return _SHARED[key]
 
 
 def install_sift(home: Path, marker: Path) -> None:
@@ -154,8 +267,18 @@ def install_sift(home: Path, marker: Path) -> None:
         logger.info("NeoCore: graphics card found (%s); installing NeoSift in the background",
                     device)
         try:
-            neosift.install(home)
+            settings = neosift.install(home)
             marker.unlink(missing_ok=True)
+            config_path = home / "config.json"
+            if config_path.exists():  # the shared memory: filter with it, as `neocore setup` does
+                from neocore.assistant import memory as dev
+
+                config = dev._read_json(config_path)
+                if config.get("relevance", "off") != "filter":
+                    dev._write_json(config_path, {**config, **settings})
+                    shared = _SHARED.get(str(home.resolve()))
+                    if shared is not None:
+                        shared.reload()
             neosift.ensure(home)
             logger.info("NeoCore: NeoSift is ready; recall is filtered from now on")
         except Exception as error:  # noqa: BLE001 - recall keeps working unfiltered
@@ -250,6 +373,12 @@ class NeoCoreMemoryProvider(MemoryProvider):
         # and a scorer tests can put in its place.
         self._last: dict[str, tuple[str, str]] = {}
         self._sift_scorer: Any = None
+        # The owner's conversations: the shared memory, and per session the time of its last
+        # compression (turns before it may be recalled back) and its turn count.
+        self._shared: SharedMemory | None = None
+        self._since: dict[str, str] = {}
+        self._turns: dict[str, int] = {}
+        self._project = HOST
 
     # -- identity ----------------------------------------------------------------------------
 
@@ -282,6 +411,10 @@ class NeoCoreMemoryProvider(MemoryProvider):
         self._shared_chat = self._scope != PROFILE_SCOPE
         # Subagents, cron runs and flushes read memory but never write it.
         self._writes = str(kwargs.get("agent_context") or "primary") == "primary"
+        self._project = str(kwargs.get("agent_identity") or HOST)
+        if owns(self._config, kwargs):
+            self._start_shared(session_id, kwargs)
+            return
         embedder = None
         model = model_folder(self._folder)
         if self._config["dense_recall"]:
@@ -313,6 +446,46 @@ class NeoCoreMemoryProvider(MemoryProvider):
                 spawn_context_thread(install_sift, name="neocore-sift-install",
                                      args=(home, self._folder / "neosift-install.json")).start()
 
+    def _start_shared(self, session_id: str, kwargs: dict[str, Any]) -> None:
+        home = sift_home()
+        self._shared = shared = shared_memory(home)
+        self._jobs = queue.Queue()
+        self._worker = spawn_context_thread(self._work, name="neocore-writer")
+        self._worker.start()
+        if not shared.local:
+            return  # the server indexes, filters and forms facts
+        from neocore.assistant import memory as dev
+
+        config = dev._read_json(home / "config.json")
+        model = home / "models" / EMBEDDER
+        if self._config["dense_recall"] and not config.get("embedder_dir"):
+            if _embedder_ready(model):
+                dev._write_json(home / "config.json", {**config, "embedder_dir": model.as_posix()})
+            else:
+                spawn_context_thread(self._fetch_shared_embedder, name="neocore-model",
+                                     args=(model,)).start()
+        if self._config["neosift"] == "auto" and self._sift_scorer is None:
+            from neocore.assistant import neosift
+
+            if neosift.installed(home):
+                spawn_context_thread(neosift.ensure, name="neocore-sift", args=(home,)).start()
+            elif self._writes:
+                spawn_context_thread(install_sift, name="neocore-sift-install",
+                                     args=(home, home / "neosift-install.json")).start()
+        # Open the store and load the embedder now, so the first real turn is not the slow one.
+        spawn_context_thread(shared.memory, name="neocore-warm").start()
+
+    def _fetch_shared_embedder(self, model: Path) -> None:
+        download_embedder(model)
+        if self._shared is not None and _embedder_ready(model):
+            from neocore.assistant import memory as dev
+
+            path = self._shared.home / "config.json"
+            config = dev._read_json(path)
+            if not config.get("embedder_dir"):
+                dev._write_json(path, {**config, "embedder_dir": model.as_posix()})
+            self._shared.reload()
+
     def shutdown(self) -> None:
         if self._jobs is not None and self._worker is not None:
             self._jobs.put(None)
@@ -324,15 +497,26 @@ class NeoCoreMemoryProvider(MemoryProvider):
             self._store = self._engine = None
 
     def system_prompt_block(self) -> str:
-        return SYSTEM_NOTE
+        return SHARED_NOTE if self._shared is not None else SYSTEM_NOTE
 
     # -- recall ------------------------------------------------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         self._status = None
-        if self._engine is None or is_trivial_prompt(query):
+        if is_trivial_prompt(query):
             return ""
         session = session_id or self._session_id
+        if self._shared is not None:
+            try:
+                rendered, count = self._shared_recall(query, session)
+            except Exception as error:  # noqa: BLE001 - a recall failure must never fail the turn
+                logger.warning("NeoCore shared recall failed: %s", error)
+                return ""
+            if count:
+                self._status = RecallStatus(provider_label=LABEL, count=count)
+            return rendered if count else ""
+        if self._engine is None:
+            return ""
         with self._held_lock:
             held = sorted(self._held.get(session, ()))
         budget = self._config["budget_chars"]
@@ -402,6 +586,39 @@ class NeoCoreMemoryProvider(MemoryProvider):
         count = len({s.evidence_id for s in delivered})
         return (rendered, count) if count and rendered.strip() else ("", 0)
 
+    def _last_turn(self, session: str) -> Any:
+        from neocore.assistant.memory import Turn
+
+        if session not in self._last:
+            return None
+        user, assistant = self._last[session]
+        return Turn(HOST, session, "", self._project, "", user, assistant)
+
+    def _shared_recall(self, query: str, session: str) -> tuple[str, int]:
+        """The shared memory's recall, exactly as Claude Code and Codex get it (NeoSift or the
+        hosted filter when the memory has one), minus what this chat already holds."""
+        shared = self._shared
+        assert shared is not None
+        since = self._since.get(session, "")
+        last = self._last_turn(session)
+        if shared.local:
+            delivered: set[str] = set()
+            with shared.lock:
+                memory = shared.memory()
+                text = memory.recall(query, exclude_session=session, host=HOST, since=since,
+                                     last=last, delivered=delivered)
+                memory.hold(HOST, session, since, delivered)
+            return (text, len(delivered)) if delivered and text.strip() else ("", 0)
+        from neocore.shared import client
+
+        answer = client.ask(shared.remote, shared.home, query, session, HOST,
+                            seconds=6.0, since=since, last=last)
+        if answer.get("error"):
+            logger.info("NeoCore memory server: no memory this turn (%s)", answer["error"])
+        text = str(answer.get("text") or "")
+        count = sum(1 for line in text.splitlines() if line.startswith("["))
+        return (text, max(count, 1)) if text.strip() else ("", 0)
+
     def recall_status(self) -> RecallStatus | None:
         return self._status
 
@@ -426,8 +643,19 @@ class NeoCoreMemoryProvider(MemoryProvider):
         metadata = {"source": "hermes"}
         if author.get("id"):
             metadata["author_id"] = str(author["id"])
-        self._last[session_id or self._session_id] = (user, assistant)
-        self._jobs.put(("turn", session_id or self._session_id, user, assistant, metadata))
+        session = session_id or self._session_id
+        self._last[session] = (user, assistant)
+        if self._shared is not None:
+            from neocore.assistant.memory import Turn
+
+            count = self._turns[session] = self._turns.get(session, 0) + 1
+            now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            now += f".{int(time.time() * 1000) % 1000:03d}Z"
+            turn_id = _tag(f"{session}:{count}:{now}:{user[:200]}")
+            self._jobs.put(("shared", Turn(HOST, session, turn_id, self._project, now, user,
+                                           assistant)))
+            return
+        self._jobs.put(("turn", session, user, assistant, metadata))
 
     def _work(self) -> None:
         jobs = self._jobs
@@ -436,6 +664,9 @@ class NeoCoreMemoryProvider(MemoryProvider):
             if job is None:
                 return
             try:
+                if job[0] == "shared":
+                    self._store_shared(job[1])
+                    continue
                 if job[0] == "turn":
                     _, session, user, assistant, metadata = job
                     from neocore.assistant.memory import redact
@@ -455,6 +686,22 @@ class NeoCoreMemoryProvider(MemoryProvider):
             finally:
                 jobs.task_done()
 
+    def _store_shared(self, turn: Any) -> None:
+        shared = self._shared
+        assert shared is not None
+        if shared.local:
+            with shared.lock:
+                memory = shared.memory()
+                memory.capture(turn)
+                memory.recall_engine.backfill(64)  # the words now; meaning with the next sync
+            shared.sync_soon()
+            return
+        from neocore.shared import client
+
+        sent = client.send_turns(shared.remote, shared.home, [turn])
+        if sent.get("error") and sent["error"] != "tools-only":
+            logger.warning("NeoCore: turn not sent to the memory server (%s)", sent["error"])
+
     def flush(self) -> None:
         """Wait until every queued turn is stored and indexed (tests, shutdown)."""
         if self._jobs is not None:
@@ -472,6 +719,7 @@ class NeoCoreMemoryProvider(MemoryProvider):
         # Compressed turns leave the context: recall may bring them back from now on.
         with self._held_lock:
             self._held.pop(self._session_id, None)
+        self._since[self._session_id] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         return ""
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "",
@@ -482,14 +730,23 @@ class NeoCoreMemoryProvider(MemoryProvider):
             if not reset and parent_session_id and parent_session_id in self._held:
                 # /branch, /resume after compression: the history the new id carries is in context.
                 self._held.setdefault(new_session_id, set()).update(self._held[parent_session_id])
+        if not reset and parent_session_id in self._since:
+            self._since.setdefault(new_session_id, self._since[parent_session_id])
         self._session_id = new_session_id
 
     # -- tools -------------------------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
+        if self._shared is not None:
+            from neocore.shared.tools import TOOLS
+
+            return [{"name": t["name"], "description": t["description"],
+                     "parameters": t["inputSchema"]} for t in TOOLS]
         return [SEARCH_TOOL, FORGET_TOOL]
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        if self._shared is not None:
+            return self._shared_tool(tool_name, args)
         if self._engine is None:
             return json.dumps({"error": "NeoCore memory is not initialized"})
         try:
@@ -500,6 +757,36 @@ class NeoCoreMemoryProvider(MemoryProvider):
         except Exception as error:  # noqa: BLE001 - tools report errors as JSON, never raise
             return json.dumps({"error": str(error)})
         return json.dumps({"error": f"unknown tool {tool_name}"})
+
+    def _shared_tool(self, name: str, args: dict[str, Any]) -> str:
+        """The shared memory's own tools (the ones Claude Code and Codex get), as plain text."""
+        shared = self._shared
+        assert shared is not None
+        if name == "neocore_remember" and not self._writes:
+            return "Not stored: this run only reads memory."
+        try:
+            if shared.local:
+                from neocore.assistant.memory import SCOPE
+
+                answer = shared.tools().call(name, args, scopes=frozenset({SCOPE}),
+                                             write_scope=SCOPE, device=HOST)
+                if name == "neocore_remember":
+                    with shared.lock:  # found by every harness from the next prompt on
+                        shared.memory().recall_engine.backfill(64)
+                return answer
+            from neocore.shared import client
+
+            reply = client.mcp(shared.remote, shared.home, {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": args}})
+            if not isinstance(reply, dict):
+                return "memory unavailable: bad reply"
+            if reply.get("error"):
+                return str((reply["error"] or {}).get("message") or "memory unavailable")
+            content = (reply.get("result") or {}).get("content") or []
+            return "\n".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+        except Exception as error:  # noqa: BLE001 - tools report errors, never raise
+            return f"error: {error}"
 
     def _search(self, args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query") or "").strip()
@@ -551,6 +838,16 @@ class NeoCoreMemoryProvider(MemoryProvider):
                             "memories locally and keeps only the ones that help. auto: installs "
                             "it once in the background when a graphics card is found (~2-3 GB, "
                             "shared with NeoCore for Claude Code and Codex). off: never."},
+            {"key": "shared", "default": DEFAULTS["shared"], "choices": list(SHARE_MODES),
+             "description": "auto: your own conversations (CLI, desktop, and direct messages "
+                            "from the ids in owners) use this machine's NeoCore memory, the one "
+                            "Claude Code and Codex share (or the memory server it is connected "
+                            "to), so every harness remembers the same things. Groups and other "
+                            "people keep their own. off: Hermes keeps a memory of its own."},
+            {"key": "owners", "default": DEFAULTS["owners"],
+             "description": "Your own user ids on messaging platforms, comma separated (e.g. "
+                            "telegram:123456789). Direct messages from them join the shared "
+                            "memory. Empty: only the CLI and desktop do."},
         ]
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:

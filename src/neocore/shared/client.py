@@ -187,7 +187,7 @@ def _key(remote: Remote) -> str:
 def _session_state(home: Path, transcript: str, host: str) -> tuple[str, dict[str, Any] | None]:
     """When the asking chat was last compacted, and its latest finished turn: both read from its
     own transcript here, since the server cannot see it."""
-    from neocore.assistant.memory import ACTION_CHARACTERS, _Compactions, last_turn, redact
+    from neocore.assistant.memory import _Compactions, last_turn
 
     path = home / "compactions.json"
     compactions = _Compactions()
@@ -198,24 +198,34 @@ def _session_state(home: Path, transcript: str, host: str) -> tuple[str, dict[st
     with contextlib.suppress(OSError):  # scanned from where the last prompt stopped
         _write_json(path, dict(list(compactions._seen.items())[-100:]))
     turn = last_turn(transcript, host)
-    if turn is None:
-        return since, None
+    return since, (None if turn is None else _shown(turn))
+
+
+def _shown(turn: Any) -> dict[str, Any]:
+    """A finished turn as the server reads it, secrets redacted here."""
+    from neocore.assistant.memory import ACTION_CHARACTERS, redact
+
     shown = asdict(turn)
     shown["user"], shown["assistant"] = redact(turn.user)[:20_000], redact(turn.assistant)[:20_000]
     shown["actions"] = [redact(a)[:ACTION_CHARACTERS] for a in turn.actions]
-    return since, shown
+    return shown
 
 
 def ask(remote: Remote, home: Path, query: str, session: str, host: str, transcript: str = "",
-        *, seconds: float = 6.0) -> dict[str, Any]:
+        *, seconds: float = 6.0, since: str | None = None,
+        last: Any = None) -> dict[str, Any]:
     """``{"text", "notice", "state", "error"}`` from the server, within ``seconds``. Never
-    raises: ``error`` says why there is no memory."""
+    raises: ``error`` says why there is no memory. A host without a transcript file (Hermes)
+    passes its own ``since`` (its last compaction) and ``last`` finished turn instead."""
     from neocore.assistant.memory import redact
 
     end = time.monotonic() + seconds
     try:
         key = _key(remote)
-        since, last = _session_state(home, transcript, host)
+        if since is None:
+            since, last = _session_state(home, transcript, host)
+        elif last is not None:
+            last = _shown(last)
         if not ensure_tunnel(home, remote, min(TUNNEL_WAIT, end - time.monotonic())):
             raise RemoteError("tunnel")
         left = end - time.monotonic()
@@ -272,6 +282,31 @@ def prepare(turn: Any) -> dict[str, Any] | None:
     sent["assistant"] = redact(turn.assistant)[:ASSISTANT_CHARACTERS]
     sent["actions"] = [redact(a)[:ACTION_CHARACTERS] for a in turn.actions]
     return sent
+
+
+def send_turns(remote: Remote, home: Path, turns: list[Any], *,
+               seconds: float = 30.0) -> dict[str, Any]:
+    """Send finished turns a host holds in memory (Hermes has no transcript file to upload
+    from). ``{"captured", "duplicate", "rejected", "error"}``; never raises."""
+    counts: dict[str, Any] = {"captured": 0, "duplicate": 0, "rejected": 0, "error": None}
+    if not remote.upload:
+        counts["error"] = "tools-only"
+        return counts
+    batch = [sent for sent in (prepare(turn) for turn in turns) if sent is not None]
+    counts["rejected"] = len(turns) - len(batch)
+    if not batch:
+        return counts
+    try:
+        key = _key(remote)
+        if not ensure_tunnel(home, remote, TUNNEL_WAIT):
+            raise RemoteError("tunnel")
+        reply = _call(remote, "POST", "/v1/capture", {"turns": batch}, key, seconds)
+    except (RemoteError, TimeoutError) as error:
+        counts["error"] = str(error) or "timeout"
+        return counts
+    for status in ("captured", "duplicate", "rejected"):
+        counts[status] += int(reply.get(status) or 0) if isinstance(reply, dict) else 0
+    return counts
 
 
 def upload_new(remote: Remote, home: Path, *, keep: Callable[[], None] | None = None,

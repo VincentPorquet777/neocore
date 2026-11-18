@@ -350,7 +350,7 @@ class Tools:
 
 _FILTERS: dict[str, Any] = {
     "project": {"type": "string", "description": "only this project (part of its folder name)"},
-    "host": {"type": "string", "description": "only this AI: claude-code, codex, note, ..."},
+    "host": {"type": "string", "description": "only this AI: claude-code, codex, hermes, note, ..."},
     "since": {"type": "string", "description": "from this date, YYYY-MM-DD"},
     "until": {"type": "string", "description": "up to this date, YYYY-MM-DD"},
     "limit": {"type": "integer", "description": "how many results (default 8, at most 50)"},

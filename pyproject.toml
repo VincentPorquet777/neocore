@@ -20,7 +20,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Dense recall (bge-small on CPU) and sleep. Without them recall is lexical (BM25) only.
+# Dense recall (bge-small) and sleep. Without them recall is lexical (BM25) only.
 embed = ["numpy>=1.24", "onnxruntime>=1.17", "tokenizers>=0.15"]
 dev = ["pytest>=8", "ruff>=0.5"]
 

@@ -16,11 +16,12 @@ from typing import Any
 
 from neocore.recall import _SPEAKER_PREFIX, _WORD, _parse_time
 
-HOSTS = {"claude-code": "Claude Code", "codex": "Codex"}
-ASSISTANTS = {"claude-code": "Claude", "codex": "Codex"}
+HOSTS = {"claude-code": "Claude Code", "codex": "Codex", "hermes": "Hermes"}
+ASSISTANTS = {"claude-code": "Claude", "codex": "Codex", "hermes": "Hermes"}
 HEAD = (
     "<neocore_memory>\n"
-    "Your memory of earlier work with this user, shared by Claude Code and Codex. "
+    "Your memory of earlier work with this user, shared by every AI harness they use (Claude "
+    "Code, Codex, Hermes, ...). "
     "Dated and in time order; where two items disagree, the newer one holds. Check live state "
     "before acting on anything that may have changed since. Items marked (replaced) are history: "
     "a newer item beside them says what holds now.\n"
