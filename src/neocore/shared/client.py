@@ -27,6 +27,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -212,16 +213,26 @@ def _shown(turn: Any) -> dict[str, Any]:
 
 
 def ask(remote: Remote, home: Path, query: str, session: str, host: str, transcript: str = "",
-        *, seconds: float = 6.0, since: str | None = None,
-        last: Any = None) -> dict[str, Any]:
+        *, seconds: float = 6.0, since: str | None = None, last: Any = None,
+        request_id: str = "", ack: bool = False, unicode_replacements: int = 0,
+        timing: dict[str, int] | None = None) -> dict[str, Any]:
     """``{"text", "notice", "state", "error"}`` from the server, within ``seconds``. Never
     raises: ``error`` says why there is no memory. A host without a transcript file (Hermes)
-    passes its own ``since`` (its last compaction) and ``last`` finished turn instead."""
-    from neocore.assistant.memory import redact
+    passes its own ``since`` (its last compaction) and ``last`` finished turn instead.
 
-    end = time.monotonic() + seconds
+    ``ack``: the caller confirms delivery with ``acknowledge(answer, home)`` once it printed the
+    text; only then does its chat hold what was shown. Without it the server counts what it
+    sent in time as delivered."""
+    from neocore.assistant.memory import redact
+    from neocore.assistant.render import normalize_request
+
+    started = time.monotonic()
+    end = started + seconds
+    request_id = request_id or uuid.uuid4().hex
     try:
         key = _key(remote)
+        query, replaced = (normalize_request(query) if _read_json(home / "config.json").get(
+            "normalize_request_text", True) is not False else (query, 0))
         if since is None:
             since, last = _session_state(home, transcript, host)
         elif last is not None:
@@ -233,18 +244,48 @@ def ask(remote: Remote, home: Path, query: str, session: str, host: str, transcr
             "query": redact(query), "host": host, "exclude_session": session, "since": since,
             "last_turn": last, "sent_epoch": time.time(),
             "deadline_epoch": time.time() + left - RETURN_RESERVE,
+            "request_id": request_id, "protocol": 2 if ack else 1,
+            "unicode_replacements": replaced + unicode_replacements,
+            "timing": {**(timing or {}),
+                       "hook_prepare": round((time.monotonic() - started) * 1000)},
         }, key, left)
         if not isinstance(reply, dict):
             raise RemoteError("bad-reply")
+        if time.monotonic() >= end:
+            raise TimeoutError("deadline")
         text = str(reply.get("text") or "")
+        receipt = reply.get("receipt") if isinstance(reply.get("receipt"), dict) else {}
         return {"text": text, "notice": "", "state": str(reply.get("state") or "ok"),
-                "error": reply.get("error")}
+                "error": reply.get("error"), "receipt": receipt, "request_id": request_id,
+                "_deadline": end, "_remote": remote}
     except TimeoutError:
         return {"text": "", "notice": "", "state": "deadline", "error": "late"}
     except RemoteError as error:
         return {"text": "", "notice": "", "state": "error", "error": str(error)}
     except Exception as error:  # fail open, whatever it was
         return {"text": "", "notice": "", "state": "error", "error": type(error).__name__}
+
+
+ACK_SECONDS = 0.5
+
+
+def acknowledge(answer: dict[str, Any], home: Path) -> bool:
+    """Tell the server the answer of ``ask(..., ack=True)`` was printed (``POST /v1/ack``), within
+    one short allowance that never outlasts the hook. Never raises."""
+    remote, receipt = answer.get("_remote"), answer.get("receipt") or {}
+    if not isinstance(remote, Remote) or not receipt.get("request_id"):
+        return False
+    end = min(float(answer.get("_deadline") or 0) + float(receipt.get("ack_grace_seconds", 3.0)),
+              time.monotonic() + ACK_SECONDS,
+              float(answer.get("_hook_deadline") or float("inf")))
+    try:
+        reply = _call(remote, "POST", "/v1/ack",
+                      {"request_id": receipt["request_id"],
+                       "text_sha256": str(receipt.get("text_sha256") or "")},
+                      _key(remote), end - time.monotonic())
+    except (RemoteError, TimeoutError):
+        return False
+    return isinstance(reply, dict) and reply.get("acked") is True
 
 
 def mcp(remote: Remote, home: Path, message: dict[str, Any], *, seconds: float = 20.0) -> Any:

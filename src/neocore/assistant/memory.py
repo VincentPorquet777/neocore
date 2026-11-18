@@ -2,26 +2,39 @@
 
 Capture reads each tool's own transcript files incrementally (user prompts and final replies only;
 tool output, reasoning and injected context are skipped, obvious secrets are redacted). Recall is
-Governed Recall: Claude Code and Codex both get it through a ``UserPromptSubmit`` hook, and Codex
-can also search it with the ``neocore_recall`` MCP tool. Formed facts, when enabled, come from a
+Governed Recall: Claude Code and Codex both get it through a ``UserPromptSubmit`` hook, and any AI
+can look things up with intent through the memory tools of the ``mcp`` command (profile, search,
+open, timeline, facts, remember: ``neocore.shared.tools``). A chat's first message also gets the
+user's briefing (``neocore.assistant.profile``). Formed facts, when enabled, come from a
 background extractor that shells out to the Codex CLI (the user's own sign-in, no API key).
+
+Recall makes no model call unless a relevance filter is configured, and repeats nothing a chat
+already holds: a line delivered to a chat (or already in its prompt or last turn, word for word)
+is not sent to it again until it is compacted. Switches in ``config.json``, all on by default:
+``recall_deadlines`` (every stage of a recall answers within the hook's deadline, or the prompt
+goes without memory), ``delivery_receipts`` (a memory counts as delivered only once the hook
+confirms it printed it; off, it counts once rendered), ``exact_copy_gate`` (line-level repeat
+catching) and ``normalize_request_text`` (repair broken characters in prompts), ``profile``.
 
 Commands (``neocore <command>``; ``neocore setup`` installs the hooks):
     sync                 ingest new Claude Code and Codex turns, then index/embed/form facts
+                         and refresh the briefing
     claude-prompt-hook   UserPromptSubmit hook: prints recalled context (fail-open)
     claude-stop-hook     Stop hook: starts a detached ``sync`` and returns immediately
     codex-prompt-hook    the same two hooks for Codex (``[hooks]`` in ``~/.codex/config.toml``)
     codex-stop-hook
-    serve                warm localhost recall daemon used by the prompt hook (idle-exits)
+    serve                warm localhost daemon used by the hooks and tools (idle-exits)
     embed-all            embed every span not yet embedded (one-off backlog)
-    mcp                  stdio MCP server with ``neocore_recall`` (syncs every few minutes)
+    mcp                  stdio MCP server with the memory tools (syncs every few minutes)
     recall QUERY         print what recall would deliver
+    profile [--rebuild]  print the user's briefing (``--rebuild``: write it now, one model call)
     status               counts and configuration
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -30,7 +43,9 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable, Collection, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +58,68 @@ BRANCH = "main"
 ASSISTANT_CHARACTERS = 8000
 RECALL_BUDGET = 8000
 MIN_PROMPT_TERMS = 3
+
+
+@dataclass(frozen=True)
+class RecallDeadline:
+    """When a recall must have answered (``time.monotonic()``), keeping ``reserve`` seconds for
+    the answer to travel back."""
+
+    end: float
+    reserve: float = 0.25
+
+    @classmethod
+    def from_wall(cls, deadline: float, reserve: float = 0.25) -> RecallDeadline:
+        return cls(time.monotonic() + max(0.0, deadline - time.time()), reserve)
+
+    def remaining(self, *, returning: bool = False) -> float:
+        return max(0.0, self.end - time.monotonic() - (0.0 if returning else self.reserve))
+
+    def check(self, *, returning: bool = False) -> None:
+        if self.remaining(returning=returning) <= 0:
+            raise TimeoutError("recall deadline")
+
+
+# A stage of a recall (a store read, a search) runs here so the recall can stop waiting for it at
+# its deadline. A stage that finishes late works on its own copy of the search caches and touches
+# no delivery state. Capacity counts running and queued stages.
+_STAGES = ThreadPoolExecutor(4, thread_name_prefix="neocore-recall")
+_STAGE_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _bounded_stage(call: Callable[[], Any], deadline: RecallDeadline | None) -> Any:
+    if deadline is None:
+        return call()
+    deadline.check()
+    if not _STAGE_SLOTS.acquire(blocking=False):
+        raise TimeoutError("recall stage busy")
+    try:
+        future = _STAGES.submit(call)
+    except BaseException:
+        _STAGE_SLOTS.release()
+        raise
+    future.add_done_callback(lambda _: _STAGE_SLOTS.release())
+    try:
+        result = future.result(timeout=deadline.remaining())
+        deadline.check()
+        return result
+    finally:
+        future.cancel()
+
+
+def _search_snapshot(engine: Any) -> Any:
+    """``engine`` with its own copies of the mutable vector-cache containers (the vector arrays
+    themselves are shared, never written in place): a search abandoned at its deadline may finish
+    in the background without racing the next recall."""
+    snapshot = copy.copy(engine)
+    for name, value in vars(engine).items():
+        if hasattr(value, "index") and hasattr(value, "ids") and hasattr(value, "blocks"):
+            cache = copy.copy(value)
+            cache.index = dict(value.index)
+            cache.ids = list(value.ids)
+            cache.blocks = list(value.blocks)
+            setattr(snapshot, name, cache)
+    return snapshot
 
 _SECRETS = re.compile(
     r"(sk-[A-Za-z0-9_\-]{20,}|sk-ant-[A-Za-z0-9_\-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}"
@@ -296,6 +373,12 @@ def last_turn(transcript: str, host: str) -> Turn | None:
     return None
 
 
+def _first_prompt(transcript: str, host: str) -> bool:
+    """No finished turn before this prompt: a new chat (its transcript may not exist yet).
+    Unknown, so False, when the host names no transcript."""
+    return bool(transcript) and last_turn(transcript, host) is None
+
+
 def _claude_turn(pending: dict[str, Any]) -> Turn:
     record = pending["record"]
     return Turn(
@@ -465,6 +548,9 @@ class DevMemory:
         from neocore.assistant.filter import Gate
 
         self.gate = Gate(home, self.config)
+        # What each recall rendered, until its asker confirms delivery (``acknowledge``).
+        self._deliveries: dict[str, dict[str, Any]] = {}
+        self._delivery_lock = threading.RLock()
 
     # -- capture ---------------------------------------------------------------------------
 
@@ -523,25 +609,71 @@ class DevMemory:
         self, query: str, *, exclude_session: str = "", host: str = "", since: str = "",
         last: Turn | None = None, timing: dict[str, int] | None = None,
         scopes: Collection[str] = (SCOPE,), delivered: set[str] | None = None,
+        deadline: RecallDeadline | None = None, request_id: str = "",
+        receipt: dict[str, Any] | None = None, protocol: int = 1, owner: str = "",
     ) -> str:
         """Recall for ``query``, leaving out what the asking session still holds in context:
-        its turns ``since`` its last compaction (all of them when it was never compacted).
+        its turns ``since`` its last compaction (all of them when it was never compacted), and
+        what earlier recalls delivered to it. A chat's first message (``last`` is None and the
+        chat holds no briefing yet) also gets the user's briefing.
+
         ``timing``: milliseconds the caller already spent, logged with this recall's own.
         ``scopes``: the memories the asker may read (a server passes its key's read scopes).
-        ``delivered``: given, the ids shown are added to it and not yet recorded as held by the
-        chat; the caller records them (``hold``) once the text really reached it."""
+        ``deadline``: the recall raises ``TimeoutError`` rather than answer after it
+        (``recall_deadlines`` in config.json). How delivery is counted:
+
+        - ``protocol=2``: the asker confirms it printed the text, with ``acknowledge`` and the
+          ``request_id`` and ``text_sha256`` put in ``receipt``; only then does the chat hold it
+          (``delivery_receipts``; when off, what is rendered counts). ``owner``: the only key
+          that may confirm.
+        - ``delivered`` given: the ids shown are added to it, and the caller records them with
+          ``hold`` once the text really reached the chat.
+        - otherwise what is rendered counts as delivered at once."""
         allowed = set(scopes)
         if not allowed:
             raise PermissionError("recall requires at least one allowed scope")
+        from neocore.assistant import profile as dev_profile
+        from neocore.assistant import render as dev_render
+        from neocore.assistant import sleep as dev_sleep
+        from neocore.assistant.filter import HOP, SOLO_EXTRA
+
         timing = dict(timing or {})
+        replacements = int(timing.pop("unicode_replacements", 0))
+        repair = bool(self.config.get("normalize_request_text", True))
+        normalised: dict[str, str] = {}
+
+        def normalize(text: str) -> str:
+            nonlocal replacements
+            if not repair:
+                return text
+            if text not in normalised:
+                normalised[text], count = dev_render.normalize_request(text)
+                replacements += count
+            return normalised[text]
+
+        query = normalize(query)
+        request_id = request_id or uuid.uuid4().hex
+        if not self.config.get("recall_deadlines", True):
+            deadline = None
+        if deadline:
+            deadline.check()
         clock = [time.perf_counter()]
 
         def lap(name: str) -> None:
             now = time.perf_counter()
             timing[name] = round((now - clock[0]) * 1000)
             clock[0] = now
+            if deadline:
+                deadline.check(returning=name == "render")
 
-        rows = self.store.rows
+        store_rows = self.store.rows
+        finalizing = False
+
+        def rows(sql: str, params: Any = ()) -> Any:
+            # Rendering may spend the time kept for the answer's way back; searching may not.
+            allowance = RecallDeadline(deadline.end, 0.0) if finalizing and deadline else deadline
+            return _bounded_stage(lambda: store_rows(sql, params), allowance)
+
         excluded: list[str] = []
         context: list[dict[str, str]] = []
         if exclude_session:
@@ -552,15 +684,23 @@ class DevMemory:
                               (thread, since))
             ]
             context = [
-                {"speaker": str(r["speaker"]), "text": str(r["content"])[:20_000]}
-                for r in reversed(rows("SELECT speaker,content FROM evidence WHERE thread_id=? "
-                                       "ORDER BY timestamp DESC LIMIT 2", (thread,)))
+                {"speaker": str(r["speaker"]), "text": normalize(str(r["content"])[:20_000]),
+                 "at": str(r["timestamp"] or "")}
+                for r in reversed(rows("SELECT speaker,content,timestamp FROM evidence WHERE "
+                                       "thread_id=? ORDER BY timestamp DESC LIMIT 2", (thread,)))
             ]
         # Whole turns: NeoSift reads the END of the reply before (a follow-up answers its last
         # lines); Jev is sent the first 500 characters of each.
         if last is not None:  # fresher than the store, which catches up on the next sync
-            context = [{"speaker": "User", "text": last.user[:20_000]},
-                       {"speaker": "Assistant", "text": last.assistant[:20_000]}]
+            context = [{"speaker": "User", "text": normalize(last.user[:20_000]),
+                        "at": last.occurred_at},
+                       {"speaker": "Assistant", "text": normalize(last.assistant[:20_000]),
+                        "at": last.occurred_at}]
+        # What the chat shows already: a memory line found here word for word is not sent. A
+        # turn from before the chat's last compaction (or of unknown time once it was compacted)
+        # may have left its window, so its lines are sent again rather than lost.
+        resident = [query, *(c["text"] for c in context if not since or c["at"] >= since)]
+        context = [{"speaker": c["speaker"], "text": c["text"]} for c in context]
         budget = int(self.config.get("budget_bytes") or RECALL_BUDGET)
         pool: dict[str, Any] = {"budget_bytes": budget, "top_facts": 40}
         inquiry, expanded = query, False
@@ -575,7 +715,7 @@ class DevMemory:
             pool = dict(POOL)
             inquiry = clean_query(query)
             if len(query_terms(inquiry)) < EXPAND_BELOW_TERMS:
-                reply = last.assistant if last is not None else next(
+                reply = normalize(last.assistant) if last is not None else next(
                     (c["text"] for c in context if c["speaker"] != "User"), "")
                 lead = clean_query(reply)[:600]
                 if len(query_terms(lead)) < 3:  # "Ok." says nothing; fall back to the prompt
@@ -588,7 +728,10 @@ class DevMemory:
         lap("context")
 
         def search(text: str) -> Any:
-            return self.recall_engine.recall(
+            # Under a deadline the search runs on a copy of the caches: if it is abandoned it
+            # finishes on its own without racing the next recall.
+            engine = _search_snapshot(self.recall_engine) if deadline else self.recall_engine
+            result = _bounded_stage(lambda: engine.recall(
                 text,
                 allowed_scopes=allowed,
                 exclude_evidence_ids=excluded,
@@ -596,14 +739,15 @@ class DevMemory:
                 # lines from the words that matched.
                 focus_turns=2,
                 **pool,
-            )
+            ), deadline)
+            if deadline:  # only a search that finished in time moves the warm caches on
+                for name in ("_span_vectors", "_fact_vectors", "_coverage"):
+                    if hasattr(engine, name):
+                        setattr(self.recall_engine, name, getattr(engine, name))
+            return result
 
         result = search(inquiry)
         lap("retrieve")
-        from neocore.assistant import render as dev_render
-        from neocore.assistant import sleep as dev_sleep
-        from neocore.assistant.filter import HOP, SOLO_EXTRA
-
         # Sleep's verdicts: a duplicate comes back as its fuller twin; a superseded fact brings
         # the newest fact that replaced it along ("Atlas is on b117" -> "... on b118").
         replaced, duplicates = dev_sleep.replacements(self.home), dev_sleep.hidden(self.home)
@@ -632,7 +776,8 @@ class DevMemory:
             marks = ",".join("?" * len(allowed))
             facts = {
                 str(r["fact_id"]): {"kind": "fact", "id": str(r["fact_id"]),
-                                    "text": str(r["text"]), "occurred_at": str(r["occurred_at"])}
+                                    "text": normalize(str(r["text"])),
+                                    "occurred_at": str(r["occurred_at"])}
                 for r in rows("SELECT fact_id,text,occurred_at FROM recall_facts WHERE "
                               f"fact_id IN ({','.join('?' * len(wanted))}) AND NOT "
                               + dev_render.unreadable_source(marks, "recall_facts.fact_id"),
@@ -646,7 +791,7 @@ class DevMemory:
             for evidence_id, spans in excerpts.items():
                 newer = list(dict.fromkeys(f for f in newer_of.get(evidence_id, []) if f in facts))
                 items.append({"kind": "excerpt", "id": evidence_id, "spans": spans,
-                              "text": "\n".join(s.text for s in spans),
+                              "text": normalize("\n".join(s.text for s in spans)),
                               **({"newer": newer} if newer else {})})
                 items += [facts[f] for f in newer if f not in listed]
                 listed.update(newer)
@@ -665,9 +810,39 @@ class DevMemory:
             return out
 
         # What this chat already received is still in its window (until it is compacted):
-        # 17% of the lines sent to 21 real chats were repeats. Send only what is new.
+        # 17% of the lines sent to 21 real chats were repeats. Send only what is new. With
+        # receipts the excerpts are compared line by line, so a turn whose other lines were
+        # shown can still give the line that was not, and a line pasted into many turns is
+        # sent once.
+        receipts = bool(self.config.get("delivery_receipts", True)) and protocol >= 2
+        exact_copy = bool(self.config.get("exact_copy_gate", True))
         held = self._held(host, exclude_session, since)
-        items = [i for i in found(result) if i["id"] not in held]
+        held_lines = self._held_hashes(host, exclude_session, since) if receipts else set()
+        legacy = self._legacy_held(host, exclude_session, since) if receipts else set()
+        novelty_log: list[dict[str, Any]] = []
+
+        def eligible(result: Any) -> list[dict[str, Any]]:
+            candidates = [i for i in found(result) if i["kind"] != "fact" or i["id"] not in held]
+            if receipts:
+                fresh: list[dict[str, Any]] = []
+                for item in candidates:
+                    if item["kind"] == "excerpt":
+                        if item["id"] in legacy:
+                            continue  # held before lines were tracked: the whole turn
+                        spans = [s for s in item["spans"]
+                                 if _short(dev_render.span_hash(s.text)) not in held_lines]
+                        if not spans:
+                            continue
+                        item = {**item, "spans": spans,
+                                "text": normalize("\n".join(s.text for s in spans))}
+                    fresh.append(item)
+                candidates = fresh
+            else:
+                candidates = [i for i in candidates if i["id"] not in held]
+            return (dev_render.novel_items(candidates, resident, novelty_log) if exact_copy
+                    else candidates)
+
+        items = eligible(result)
         lap("items")
         extra = int(self.config.get("solo_extra", SOLO_EXTRA)) if expanded else 0
         if extra > 0:
@@ -678,10 +853,37 @@ class DevMemory:
             from neocore.assistant.filter import clean_query
 
             have = {i["id"] for i in items}
-            items += [i for i in found(search(clean_query(query)))
-                      if i["id"] not in have and i["id"] not in held][:extra]
+            try:
+                solo = eligible(search(clean_query(query)))
+            except TimeoutError:
+                solo = []
+            items += [i for i in solo if i["id"] not in have][:extra]
             lap("solo")
-        keep, record = self.gate.select(query, context, items, host)
+        # A chat's first message gets the user's briefing; the chat then holds it like any
+        # memory (until it is compacted).
+        profile_id = dev_render.PROFILE_ID + dev_profile.scope_key(allowed)
+        briefing = ""
+        if last is None and self.config.get("profile", True) and profile_id not in held:
+            briefing = normalize(dev_profile.get(self.home, allowed))
+        # Scoring stops early enough to finish: given the whole remainder, a slow scorer used it
+        # all and the recall then failed its own deadline, delivering nothing.
+        scoring: float | None = None
+        if deadline and items and self.gate.mode in ("shadow", "filter"):
+            left = deadline.remaining()
+            finish = float(self.config.get("select_finish_seconds", 0.35))
+            scoring = min(self.gate.timeout, left - min(finish, left / 4))
+        if scoring is not None and scoring <= 0:
+            if not briefing:
+                raise TimeoutError("recall deadline")
+            # No time to score: the first message still gets its briefing.
+            keep, record = [], {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "host": host, "mode": self.gate.mode, "status": "deadline",
+                                "kept": 0}
+        else:
+            keep, record = self.gate.select(query, context, items, host, timeout=scoring)
+        if (deadline and keep == [] and record.get("status") == "error:TimeoutError"
+                and not briefing):
+            raise TimeoutError("recall deadline")
         lap("select")
         if self.config.get("share") is True:
             from neocore.assistant import share as dev_share
@@ -695,78 +897,187 @@ class DevMemory:
                 pass
         sources = self.gate.hop_sources(items, record) if keep is not None else []
         pool_items = list(items)
-        if sources and sum(timing.values()) < HOP["within_ms"]:
+        hop_allowance = float(self.config.get("hop_allowance_seconds", 0.75 + HOP["timeout"]))
+        if sources and (deadline.remaining() >= hop_allowance if deadline
+                        else sum(timing.values()) < HOP["within_ms"]):
             # Second search: what the best memories are about, which the prompt's own words
             # did not reach ("upgrade every gateway" -> the gateways it names -> their hosts).
+            # Under a deadline it has its own slice of time, so the first pass stays returnable.
             have = {i["id"] for i in items}
-            more = [i for i in found(search("\n".join(sources)))
-                    if i["id"] not in have and i["id"] not in held]
-            pool_items += more
-            lap("hop")
-            if more and keep is not None:
-                keep = self.gate.extend(query, context, keep, more, record)
-                lap("hop_select")
+            first_keep, first_record = keep, copy.deepcopy(record)
+            outer = deadline
+            try:
+                if deadline:
+                    deadline = RecallDeadline(min(deadline.end - deadline.reserve,
+                                                  time.monotonic() + hop_allowance), 0.0)
+                more = [i for i in eligible(search("\n".join(sources))) if i["id"] not in have]
+                pool_items += more
+                lap("hop")
+                if more and keep is not None:
+                    keep = self.gate.extend(query, context, keep, more, record,
+                                            timeout=deadline.remaining() if deadline else None)
+                    lap("hop_select")
+            except TimeoutError:
+                if outer is None:
+                    raise
+                keep, record = first_keep, first_record
+                record["second"] = {"status": "deadline", "kept": 0}
+            finally:
+                deadline = outer
         if keep:
             keep = with_newer(keep, pool_items)
         record["bytes"] = len(result.rendered.encode())
         chosen = items if keep is None else keep
-        if keep and self.gate.learning != "off":
-            from neocore.assistant import outcomes as dev_outcomes
-
-            # sync asks, once the reply is stored, which of these the reply needed
-            dev_outcomes.remember(self.home, host=host, session=exclude_session, prompt=query,
-                                  items=keep, at=str(record["at"]))
+        finalizing = True
         origin = dev_render.provenance(rows, [i["id"] for i in chosen if i["kind"] == "excerpt"],
                                        [i["id"] for i in chosen if i["kind"] == "fact"])
         # A lesson ("last time this broke because ...") is spent first: it prevents mistakes.
         chosen = sorted(chosen, key=lambda i: not dev_render.is_lesson(i))
         shown: set[str] = set()
-        rendered = dev_render.render(chosen, origin, budget, shown)
-        if delivered is None:
-            self._hold(host, exclude_session, since, shown)
-        else:
-            delivered.update(shown)
+        emitted: list[dict[str, Any]] = []
+        rendered = dev_render.render(chosen, origin, budget, shown, receipt=emitted,
+                                     resident=resident, exact_copy=exact_copy,
+                                     shadow=novelty_log, profile=briefing)
+        if briefing and rendered:
+            shown.add(profile_id)
         record["held"] = len(held)
         record["bytes_kept"] = len(rendered.encode())
+        record["profile"] = len(briefing)
         lap("render")
         record["timing"] = timing
+        record.update(request_id=request_id, rendered=len(shown),
+                      unicode_replacements=replacements,
+                      novelty=[{k: v for k, v in n.items() if k != "hash"} for n in novelty_log])
+        digest = hashlib.sha256(rendered.encode()).hexdigest()
+        grace = max(0.0, float(self.config.get("delivery_ack_grace_seconds", 3.0)))
+        if receipt is not None:
+            receipt.update(request_id=request_id, text_sha256=digest, ack_grace_seconds=grace,
+                           rendered_ids=sorted(shown))
+        entry = {
+            "host": host, "session": exclude_session, "since": since, "ids": set(shown),
+            "hashes": {_short(h) for item in emitted for h in item["span_hashes"]},
+            "prompt": query, "items": emitted, "at": str(record["at"]), "owner": owner,
+            "learn": bool(keep) and self.gate.learning != "off", "digest": digest,
+            "expires": (deadline.end if deadline else time.monotonic() + ASK_SECONDS) + grace,
+            "acked": False,
+        }
+        with self._delivery_lock:
+            self._prune_deliveries()
+            self._deliveries[request_id] = entry
+            if delivered is not None:
+                delivered.update(shown)  # the caller holds them once the text reached the chat
+            elif not receipts:
+                self._commit(entry)  # what is rendered counts as delivered
+        record["delivery"] = "pending" if receipts or delivered is not None else "rendered"
         self.gate.log(record)
         return rendered
 
     # -- what each chat already holds -----------------------------------------------------
 
     HELD_CHATS = 300
+    HELD_LINES = 3000  # line hashes kept per chat (the newest)
 
-    def _held(self, host: str, session: str, since: str) -> set[str]:
+    def _prune_deliveries(self) -> None:
+        now = time.monotonic()
+        self._deliveries = {
+            k: v for k, v in self._deliveries.items()
+            if v["expires"] > now or (v["acked"] and v["expires"] + 60 > now)}
+        # Bounded even for askers that never confirm.
+        self._deliveries = dict(list(self._deliveries.items())[-512:])
+
+    def acknowledge(self, request_id: str, text_sha256: str, *, key_id: str = "") -> bool:
+        """The asker printed the text of recall ``request_id``: from now on its chat holds
+        what it showed. Refused when the text differs, the delivery expired, or ``key_id`` is
+        not the key the answer went to."""
+        with self._delivery_lock:
+            self._prune_deliveries()
+            entry = self._deliveries.get(request_id)
+            if not entry or entry["digest"] != text_sha256 or entry["owner"] != key_id:
+                return False
+            if entry["acked"]:
+                return True
+            if time.monotonic() >= entry["expires"]:
+                return False
+            self._commit(entry)
+            return True
+
+    def _commit(self, entry: dict[str, Any]) -> None:
+        """One delivery reached its chat: it holds the ids and lines shown, and (filter mode)
+        what was shown is remembered to learn from the reply."""
+        entry["acked"] = True
+        self._hold(entry["host"], entry["session"], entry["since"], entry["ids"],
+                   entry["hashes"])
+        if entry["learn"]:
+            from neocore.assistant import outcomes as dev_outcomes
+
+            # sync asks, once the reply is stored, which of these the reply needed
+            dev_outcomes.remember(self.home, host=entry["host"], session=entry["session"],
+                                  prompt=entry["prompt"], items=entry["items"], at=entry["at"])
+
+    def _entry(self, host: str, session: str, since: str) -> dict[str, Any]:
         if not session:
-            return set()
+            return {}
         with _HELD_LOCK:
             entry = _read_json(self.home / "held.json").get(f"{host}:{session}") or {}
-        return set(entry.get("ids", [])) if entry.get("since", "") == since else set()
+        return entry if _epoch_order(since, str(entry.get("since") or "")) == 0 else {}
 
-    def hold(self, host: str, session: str, since: str, ids: set[str]) -> None:
-        """Record that a chat received ``ids`` (its window holds them until it is compacted)."""
-        self._hold(host, session, since, ids)
+    def _held(self, host: str, session: str, since: str) -> set[str]:
+        return set(self._entry(host, session, since).get("ids", []))
 
-    def _hold(self, host: str, session: str, since: str, ids: set[str]) -> None:
-        if not (session and ids):
+    def _held_hashes(self, host: str, session: str, since: str) -> set[str]:
+        return set(self._entry(host, session, since).get("span_hashes", []))
+
+    def _legacy_held(self, host: str, session: str, since: str) -> set[str]:
+        """Ids held before lines were tracked (an older version): whole turns."""
+        entry = self._entry(host, session, since)
+        return set(entry.get("legacy_ids", entry.get("ids", []) if "span_hashes" not in entry
+                                 else []))
+
+    def hold(self, host: str, session: str, since: str, ids: set[str],
+             hashes: set[str] | None = None) -> None:
+        """Record that a chat received ``ids`` (its window holds them until it is compacted):
+        for a caller that passed ``delivered`` to ``recall``, once the text reached the chat.
+        The lines those recalls showed are held with them."""
+        lines = set(hashes or ())
+        with self._delivery_lock:
+            for entry in self._deliveries.values():
+                if (not entry["acked"] and entry["ids"] & ids
+                        and (entry["host"], entry["session"], entry["since"])
+                        == (host, session, since)):
+                    self._commit(entry)
+        self._hold(host, session, since, ids, lines)
+
+    def _hold(self, host: str, session: str, since: str, ids: set[str],
+              hashes: set[str] | None = None) -> None:
+        if not (session and (ids or hashes)):
             return
         key = f"{host}:{session}"
         with _HELD_LOCK:
             path = self.home / "held.json"
             state = _read_json(path)
-            entry = state.pop(key, None) or {}
-            if entry.get("since", since) != since:  # compacted: the window starts again
-                entry = {"since": since, "ids": []}
-            entry["since"], entry["ids"] = since, sorted(set(entry.get("ids", [])) | ids)
+            entry = state.get(key) or {}
+            order = _epoch_order(since, str(entry.get("since") or ""))
+            if order is None or order < 0:
+                return  # a late confirmation never undoes a later compaction
+            state.pop(key, None)
+            if order > 0:  # compacted: the window starts again
+                entry = {}
+            if entry.get("ids") and "span_hashes" not in entry:
+                entry["legacy_ids"] = list(entry["ids"])
+            entry["since"], entry["ids"] = since, sorted(set(entry.get("ids", [])) | set(ids))
+            known = list(entry.get("span_hashes", []))
+            known += sorted(set(hashes or ()) - set(known))
+            entry["span_hashes"] = known[-self.HELD_LINES:]
             state[key] = entry  # newest last; the oldest chats fall off
             _write_json(path, dict(list(state.items())[-self.HELD_CHATS:]))
 
     # -- maintenance -----------------------------------------------------------------------
 
-    def maintain(self, keep: Callable[[], None] | None = None) -> dict[str, Any]:
-        """Index, judge outcomes, form facts, sleep. ``keep`` is called between these steps and
-        before each model call (``sync`` renews its lock with it)."""
+    def maintain(self, keep: Callable[[], None] | None = None, *,
+                 profile_scopes: list[frozenset[str]] | None = None) -> dict[str, Any]:
+        """Index, judge outcomes, form facts, sleep, refresh the user's briefings (one per scope
+        set in ``profile_scopes``; default: the local scope). ``keep`` is called between these
+        steps and before each model call (``sync`` renews its lock with it)."""
         renew = keep or (lambda: None)
         receipt: dict[str, Any] = {"index": self.recall_engine.backfill(2048)}
         renew()
@@ -822,7 +1133,45 @@ class DevMemory:
                     receipt["lessons"] = dev_lessons.backfill(
                         self.store.rows, self.recall_engine.add_fact,
                         self.home, _renewing(ask, renew), max_calls=lesson_calls)
+            if self.config.get("profile", True):
+                # One model call per scope set, and only when its briefing is due.
+                from neocore.assistant import profile as dev_profile
+
+                receipt["profile"] = []
+                for scopes in profile_scopes or [frozenset({SCOPE})]:
+                    renew()
+                    try:
+                        receipt["profile"].append(dev_profile.build(
+                            self.store.rows, self.home, _renewing(ask, renew), scopes))
+                    except Exception as error:  # the model may be away; the next sync retries
+                        receipt["profile"].append({"error": type(error).__name__})
         return receipt
+
+
+def _short(line_hash: str) -> str:
+    """A line hash as ``held.json`` keeps it: 80 bits tell a chat's lines apart."""
+    return line_hash[:20]
+
+
+def _epoch_order(candidate: str, current: str) -> int | None:
+    """How compaction time ``candidate`` compares with ``current`` (-1, 0, 1); "" is before any
+    compaction; None when either cannot be read."""
+    from datetime import timezone
+
+    from neocore.recall import _parse_time
+
+    if candidate == current:
+        return 0
+    if not current:
+        return 1
+    if not candidate:
+        return -1
+    left, right = _parse_time(candidate), _parse_time(current)
+    if left is None or right is None:
+        return None
+    left = left.replace(tzinfo=left.tzinfo or timezone.utc).astimezone(timezone.utc)
+    right = right.replace(tzinfo=right.tzinfo or timezone.utc).astimezone(timezone.utc)
+    return (left > right) - (left < right)
 
 
 _HELD_LOCK = threading.Lock()
@@ -1086,72 +1435,190 @@ class _Compactions:
         return when
 
 
+TOOL_SECONDS = 20.0  # a memory tool call gets this long, prompts first
+
+
+class _Owner:
+    """The one worker that touches the warm memory: prompt recalls and tool calls run on it one
+    at a time, prompts first; a full queue answers ``busy`` and a job past its asker's deadline
+    is dropped. Delivery confirmations do not queue (``DevMemory.acknowledge`` locks itself)."""
+
+    def __init__(self, memory: DevMemory, compactions: _Compactions) -> None:
+        self.memory, self.compactions = memory, compactions
+        self.pool = ThreadPoolExecutor(1, thread_name_prefix="neocore-owner")
+        self.size = max(1, min(64, int(memory.config.get("recall_queue_size", 8))))
+        self.waiting = 0
+        self.lock = threading.Lock()
+        self._tools: Any = None
+
+    def run(self, job: Callable[[], dict[str, Any]], budget: RecallDeadline) -> dict[str, Any]:
+        from concurrent.futures import TimeoutError as FutureTimeout
+
+        with self.lock:
+            if self.waiting >= self.size:
+                return {"state": "busy", "error": "busy", "text": ""}
+            self.waiting += 1
+
+        def work() -> dict[str, Any]:
+            with self.lock:
+                self.waiting -= 1
+            budget.check(returning=True)  # its asker has gone: running it would only delay
+            return job()
+
+        future = self.pool.submit(work)
+        try:
+            return future.result(timeout=budget.remaining(returning=True))
+        except (TimeoutError, FutureTimeout):
+            if future.cancel():
+                with self.lock:
+                    self.waiting -= 1
+            return {"state": "deadline", "error": "late", "text": ""}
+
+    def recall(self, request: dict[str, Any]) -> dict[str, Any]:
+        memory = self.memory
+        budget = RecallDeadline.from_wall(
+            float(request.get("deadline") or time.time() + ASK_SECONDS),
+            float(memory.config.get("recall_return_reserve_seconds", 0.25)))
+        protocol = 2 if request.get("protocol") == 2 else 1
+
+        def job() -> dict[str, Any]:
+            from neocore.assistant.filter import count_miss, notice
+
+            started = time.perf_counter()
+            transcript, host = str(request.get("transcript") or ""), str(
+                request.get("host") or "")
+            # Read on a copy: a transcript read abandoned at the deadline changes nothing.
+            seen = _Compactions()
+            seen._seen = dict(self.compactions._seen)
+            try:
+                since, turn = _bounded_stage(
+                    lambda: (seen.last(transcript), last_turn(transcript, host)),
+                    budget if memory.config.get("recall_deadlines", True) else None)
+                self.compactions._seen = seen._seen
+                timing = {k: int(v) for k, v in (request.get("timing") or {}).items()
+                          if isinstance(v, (int, float))}
+                timing["unicode_replacements"] = int(request.get("unicode_replacements") or 0)
+                timing["transcript"] = round((time.perf_counter() - started) * 1000)
+                receipt: dict[str, Any] = {}
+                text = memory.recall(
+                    str(request.get("query") or ""),
+                    exclude_session=str(request.get("exclude_session") or ""),
+                    host=host, since=since, last=turn, timing=timing, deadline=budget,
+                    request_id=str(request.get("request_id") or ""), receipt=receipt,
+                    protocol=protocol)
+                budget.check(returning=True)
+            except TimeoutError:
+                return {"state": "deadline", "error": "late", "text": ""}
+            except Exception as error:
+                # Closing without a word reached the hook as a JSONDecodeError and left no trace
+                # of the cause.
+                _log_daemon_error(error)
+                return {"state": "error", "error": type(error).__name__, "text": ""}
+            count_miss(memory.home, missed=False)
+            reply = {"state": "ok" if text else "empty", "text": text,
+                     "notice": notice(memory.home) if request.get("notices") else ""}
+            if protocol == 2:
+                reply["receipt"] = {k: receipt[k] for k in
+                                    ("request_id", "text_sha256", "ack_grace_seconds")
+                                    if k in receipt}
+            return reply
+
+        return self.run(job, budget)
+
+    def tool(self, request: dict[str, Any]) -> dict[str, Any]:
+        """One memory tool call (``neocore.shared.tools``) on the warm memory."""
+
+        def job() -> dict[str, Any]:
+            from neocore.shared.tools import ToolError, Tools
+
+            name = str(request.get("name") or "")
+            try:
+                if self._tools is None:
+                    self._tools = Tools(self.memory)
+                text = self._tools.call(name, request.get("arguments") or {},
+                                        scopes=frozenset({SCOPE}), write_scope=SCOPE,
+                                        device="this-computer")
+                if name == "neocore_remember":
+                    self.memory.recall_engine.backfill(64)  # found from the next prompt on
+                return {"text": text, "is_error": False}
+            except (ToolError, PermissionError) as error:
+                return {"text": str(error), "is_error": True}
+            except Exception as error:
+                _log_daemon_error(error)
+                return {"text": f"(memory unavailable: {type(error).__name__})",
+                        "is_error": True}
+
+        return self.run(job, RecallDeadline(time.monotonic() + TOOL_SECONDS, 0.0))
+
+    def stop(self) -> None:
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _serve(token: str, socket: Any) -> None:
+    """Each connection on its own thread (at most 16); recalls and tool calls go to the one
+    owner of the warm memory, delivery confirmations straight to it."""
     memory = DevMemory()
-    compactions = _Compactions()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
-    listener.listen(8)
-    listener.settimeout(min(60, IDLE_SECONDS))
+    listener.listen(16)
+    listener.settimeout(min(1.0, IDLE_SECONDS))
     # Loads the vector caches; straight to the engine so it is neither scored nor logged. The
     # wide pool's first recall took 8 s (fact vectors) and so timed out the first real prompt.
-    from neocore.assistant.filter import POOL, count_miss, notice
+    from neocore.assistant.filter import POOL
 
     memory.recall_engine.recall("warm up", allowed_scopes={SCOPE},
                                 **(POOL if memory.gate.wide else {}))
+    owner = _Owner(memory, _Compactions())
     # Published only once warm: start-up takes ~30 s, and a prompt that connected meanwhile
     # waited out its whole timeout (5 of 6 after a release) instead of hearing "starting".
     _write_json(HOME / "daemon.json",
                 {"port": listener.getsockname()[1], "token": token, "pid": os.getpid()})
-    last = time.time()
+    sockets = threading.BoundedSemaphore(16)
+    activity = [time.monotonic()]
+
+    def handle(connection: Any) -> None:
+        try:
+            with connection:
+                connection.settimeout(10)
+                with connection.makefile("r", encoding="utf-8") as reader:
+                    line = reader.readline(1_000_001)
+                request = json.loads(line) if len(line) <= 1_000_000 else {}
+                if not isinstance(request, dict) or request.get("token") != token:
+                    return  # a wrong token gets nothing
+                activity[0] = time.monotonic()
+                action = request.get("action")
+                if action == "ack":
+                    acked = memory.acknowledge(str(request.get("request_id") or ""),
+                                               str(request.get("text_sha256") or ""))
+                    reply: dict[str, Any] = {"state": "ok" if acked else "deadline",
+                                             "acked": acked}
+                elif action == "tool":
+                    reply = owner.tool(request)
+                elif time.time() > float(request.get("deadline") or "inf"):
+                    # its hook gave up (or is about to); recalling would delay the next one
+                    reply = {"error": "late"}
+                else:
+                    reply = owner.recall(request)
+                connection.sendall((json.dumps(reply) + "\n").encode())
+                activity[0] = time.monotonic()
+        except (OSError, ValueError):
+            pass
+        finally:
+            sockets.release()
+
     try:
-        while time.time() - last < IDLE_SECONDS:
+        while time.monotonic() - activity[0] < IDLE_SECONDS:
             try:
                 connection, _ = listener.accept()
             except TimeoutError:
                 continue
-            with connection:
-                connection.settimeout(10)
-                known = False
-                try:
-                    request = json.loads(connection.makefile("r", encoding="utf-8").readline())
-                    if request.get("token") != token:
-                        continue
-                    known = True
-                    if time.time() > float(request.get("deadline") or "inf"):
-                        # its hook gave up (or is about to); recalling would delay the next one
-                        connection.sendall(b'{"error": "late"}\n')
-                        continue
-                    started = time.perf_counter()
-                    transcript, host = str(request.get("transcript") or ""), str(
-                        request.get("host") or "")
-                    since, turn = compactions.last(transcript), last_turn(transcript, host)
-                    text = memory.recall(
-                        str(request.get("query") or ""),
-                        exclude_session=str(request.get("exclude_session") or ""),
-                        host=host, since=since, last=turn,
-                        timing={"transcript": round((time.perf_counter() - started) * 1000),
-                                "since_sent": round(max(0.0, time.time() - float(
-                                    request.get("deadline") or time.time() + ASK_SECONDS - 1)
-                                    + ASK_SECONDS - 1) * 1000)},
-                    )
-                    count_miss(memory.home, missed=False)
-                    warning = notice(memory.home) if request.get("notices") else ""
-                    connection.sendall((json.dumps({"text": text, "notice": warning})
-                                        + "\n").encode())
-                except Exception as error:
-                    # Closing without a word reached the hook as a JSONDecodeError (5 prompts
-                    # in two days) and left no trace of the cause.
-                    _log_daemon_error(error)
-                    if known:
-                        try:
-                            connection.sendall((json.dumps({"error": type(error).__name__})
-                                                + "\n").encode())
-                        except OSError:
-                            pass
-                    continue
-            last = time.time()
+            if not sockets.acquire(blocking=False):
+                connection.close()
+                continue
+            threading.Thread(target=handle, args=(connection,), daemon=True).start()
     finally:
+        listener.close()
+        owner.stop()
         if _read_json(HOME / "daemon.json").get("pid") == os.getpid():
             (HOME / "daemon.json").unlink(missing_ok=True)
 
@@ -1194,38 +1661,96 @@ def _detached(*args: str) -> None:
     )
 
 
-ASK_SECONDS = 6.0  # recall ~0.5 s + scoring up to 3 s; the hooks allow 10
+ASK_SECONDS = 6.0  # recall ~0.5 s + scoring up to 4.5 s; the hooks allow 10
+ACK_SECONDS = 0.5  # the delivery confirmation's own allowance, after the text is printed
+HOOK_SECONDS = 10.0
+DAEMON_WAIT = 30.0  # a tool call waits this long for a daemon that is starting
 # Hosts whose prompt-hook output takes ``systemMessage`` (Codex 0.158's user-prompt-submit
 # output schema lists it next to hookSpecificOutput).
 NOTICE_HOSTS = {"claude-code", "codex"}
 
 
-def _ask_daemon(query: str, exclude_session: str, host: str, transcript: str = "",
-                notices: bool = False) -> dict[str, Any] | None:
-    """``{"text", "notice"}`` from the daemon (``"error"`` when it is busy or slow); None when
-    no daemon is running."""
+def _repair(text: str) -> tuple[str, int]:
+    """``text`` with broken characters repaired (``normalize_request_text``, on by default)."""
+    if _read_json(HOME / "config.json").get("normalize_request_text", True) is False:
+        return text, 0
+    from neocore.assistant.render import normalize_request
 
+    return normalize_request(text)
+
+
+def _daemon_call(message: dict[str, Any], budget: RecallDeadline) -> dict[str, Any] | None:
+    """One request to the warm daemon, answered within ``budget``. None when no daemon runs;
+    ``{"error": "starting"}`` while one warms up. Raises ``OSError`` or ``ValueError``."""
     import socket
 
     daemon = _read_json(HOME / "daemon.json")
     if not daemon or not _alive(int(daemon.get("pid") or 0)):
-        return {"text": "", "notice": "", "error": "starting"} if _starting() else None
+        return {"error": "starting"} if _starting() else None
+    budget.check(returning=True)
+    with socket.create_connection(("127.0.0.1", int(daemon["port"])),
+                                  timeout=budget.remaining(returning=True)) as sock:
+        sock.settimeout(budget.remaining(returning=True))
+        sock.sendall((json.dumps({"token": daemon["token"], **message}) + "\n").encode())
+        reply = json.loads(sock.makefile("r", encoding="utf-8").readline())
+    if not isinstance(reply, dict):
+        raise ValueError("bad reply")
+    return reply
+
+
+def _ask_daemon(query: str, exclude_session: str, host: str, transcript: str = "",
+                notices: bool = False, *, request_id: str = "", deadline: float | None = None,
+                unicode_replacements: int = 0, protocol: int = 2,
+                timing: dict[str, int] | None = None) -> dict[str, Any] | None:
+    """``{"text", "notice", "receipt", ...}`` from the daemon (``"error"`` when it is busy,
+    slow or starting); None when no daemon is running. ``deadline`` (``time.time()``): when the
+    hook must have its answer."""
+    started = time.monotonic()
+    deadline = deadline if deadline is not None else time.time() + ASK_SECONDS
+    budget = RecallDeadline.from_wall(deadline, 0.0)
+    request_id = request_id or uuid.uuid4().hex
+    query, replaced = _repair(query)
     try:
-        with socket.create_connection(("127.0.0.1", int(daemon["port"])),
-                                      timeout=ASK_SECONDS) as sock:
-            sock.settimeout(ASK_SECONDS)
-            sock.sendall((json.dumps({"token": daemon["token"], "query": query,
-                                      "exclude_session": exclude_session, "host": host,
-                                      "transcript": transcript, "notices": notices,
-                                      "deadline": time.time() + ASK_SECONDS - 1})
-                          + "\n").encode())
-            reply = json.loads(sock.makefile("r", encoding="utf-8").readline())
-        if reply.get("error"):  # the daemon's own reason; the traceback is in its error log
-            return {"text": "", "notice": "", "error": str(reply["error"])}
-        return {"text": str(reply.get("text") or ""), "notice": str(reply.get("notice") or "")}
+        reply = _daemon_call({
+            "query": query, "exclude_session": exclude_session, "host": host,
+            "transcript": transcript, "notices": notices, "deadline": deadline,
+            "request_id": request_id, "protocol": protocol,
+            "unicode_replacements": replaced + unicode_replacements,
+            "timing": {**(timing or {}),
+                       "hook_prepare": round((time.monotonic() - started) * 1000)},
+        }, budget)
     except (OSError, ValueError, KeyError, AttributeError) as error:
         # a live but slow daemon: skip this prompt rather than start another
-        return {"text": "", "notice": "", "error": type(error).__name__}
+        return {"text": "", "notice": "", "error": type(error).__name__,
+                "request_id": request_id}
+    if reply is None:
+        return None
+    if budget.remaining(returning=True) <= 0:
+        return {"text": "", "notice": "", "error": "late", "request_id": request_id}
+    if reply.get("error"):  # the daemon's own reason; the traceback is in its error log
+        return {"text": "", "notice": "", "error": str(reply["error"]),
+                "request_id": request_id}
+    return {"text": str(reply.get("text") or ""), "notice": str(reply.get("notice") or ""),
+            "receipt": reply.get("receipt") or {}, "request_id": request_id,
+            "_deadline": budget.end}
+
+
+def _ack_daemon(answer: dict[str, Any]) -> bool:
+    """Tell the daemon the hook printed the answer: only now does the chat hold what it showed.
+    A short allowance of its own, never past the hook's."""
+    receipt = answer.get("receipt") or {}
+    if not receipt.get("request_id"):
+        return False
+    end = min(float(answer.get("_deadline") or 0) + float(receipt.get("ack_grace_seconds", 3.0)),
+              time.monotonic() + ACK_SECONDS,
+              float(answer.get("_hook_deadline") or float("inf")))
+    try:
+        reply = _daemon_call({"action": "ack", "request_id": receipt["request_id"],
+                              "text_sha256": receipt.get("text_sha256") or ""},
+                             RecallDeadline(end, 0.0))
+    except (OSError, ValueError, KeyError):
+        return False
+    return bool(reply and reply.get("acked"))
 
 
 def _starting() -> bool:
@@ -1236,52 +1761,68 @@ def _starting() -> bool:
         return False
 
 
-def _log_miss(host: str, status: str) -> None:
+def _log_miss(host: str, status: str, request_id: str = "") -> None:
     """A prompt that got no memory because the daemon was down or slow; ``stats`` counts it."""
     from neocore.assistant.filter import log_record
 
     log_record(HOME, {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "host": host,
-                      "mode": "hook", "status": f"error:{status}", "kept": 0})
+                      "mode": "hook", "status": f"error:{status}", "kept": 0,
+                      **({"request_id": request_id} if request_id else {})})
 
 
 def claude_prompt_hook(host: str = "claude-code") -> None:
     """``UserPromptSubmit`` hook for Claude Code, and for Codex (same event shape) with
-    ``host="codex"``: the recalled memory rides along with the prompt."""
+    ``host="codex"``: the recalled memory rides along with the prompt. The answer is used only
+    if it arrives within ``ASK_SECONDS``; once printed, the hook confirms the delivery."""
+    started = time.monotonic()
+    deadline = time.time() + ASK_SECONDS
+    request_id = uuid.uuid4().hex
     try:
         from neocore.recall import query_terms
 
         if os.environ.get("NEOCORE_DISABLED"):
             return
         event = json.loads(sys.stdin.read() or "{}")
-        prompt = str(event.get("prompt") or "").strip()
+        prompt, replaced = _repair(str(event.get("prompt") or ""))
+        prompt = prompt.strip()
         if host == "codex":
             prompt = codex_user_request(prompt)  # the user's words, without attachment wrappers
+        session, transcript = str(event.get("session_id") or ""), str(
+            event.get("transcript_path") or "")
         # "continue", "make it live", "bro how many times????": the session already holds the
-        # context, and recall on two words only adds noise.
-        if len(query_terms(prompt)) < MIN_PROMPT_TERMS or is_machine_prompt(prompt):
+        # context, and recall on two words only adds noise. A chat's first message still asks:
+        # it gets the user's briefing. No words at all: nothing to ask with.
+        if not prompt or is_machine_prompt(prompt) or (
+                len(query_terms(prompt)) < MIN_PROMPT_TERMS
+                and not _first_prompt(transcript, host)):
             return
         from neocore.shared import client
 
-        session, transcript = str(event.get("session_id") or ""), str(
-            event.get("transcript_path") or "")
+        receipts = _read_json(HOME / "config.json").get("delivery_receipts", True) is not False
+        timing = {"hook_parse": round((time.monotonic() - started) * 1000)}
         remote = client.load(HOME)
         if remote is not None:  # the memory lives on a server (``neocore connect``)
             answer = client.ask(remote, HOME, prompt, session, host, transcript,
-                                seconds=ASK_SECONDS)
+                                seconds=max(0.0, deadline - time.time()),
+                                request_id=request_id, ack=receipts,
+                                unicode_replacements=replaced, timing=timing)
             source = "remote"
             if not answer.get("error"):
                 from neocore.assistant.filter import count_miss
 
                 count_miss(HOME, missed=False)  # the daemon does this itself in local mode
         else:
-            local = _ask_daemon(prompt, session, host, transcript, notices=host in NOTICE_HOSTS)
+            local = _ask_daemon(prompt, session, host, transcript, notices=host in NOTICE_HOSTS,
+                                request_id=request_id, deadline=deadline,
+                                unicode_replacements=replaced, protocol=2 if receipts else 1,
+                                timing=timing)
             if local is None:
                 _detached("serve")  # warm up for the next prompt; never delay this one
-                _log_miss(host, "no-daemon")
+                _log_miss(host, "no-daemon", request_id)
                 return
             answer, source = local, "daemon"
         if answer.get("error"):
-            _log_miss(host, f"{source}-{answer['error']}")
+            _log_miss(host, f"{source}-{answer['error']}", request_id)
             if answer["error"] != "starting":  # after a release or an idle night: expected
                 from neocore.assistant.filter import count_miss, notice
 
@@ -1289,13 +1830,22 @@ def claude_prompt_hook(host: str = "claude-code") -> None:
                 if host in NOTICE_HOSTS:
                     answer["notice"] = notice(HOME)
         output: dict[str, Any] = {}
-        if answer["text"]:
+        if answer.get("text"):
             output["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit",
                                             "additionalContext": answer["text"]}
-        if answer["notice"]:
+        if answer.get("notice"):
             output["systemMessage"] = answer["notice"]  # shown to the user, not the model
-        if output:
-            print(json.dumps(output))
+        if not output:
+            return
+        if answer.get("_deadline") and time.monotonic() >= float(answer["_deadline"]):
+            return  # too late: the host may already have gone on without it
+        print(json.dumps(output), flush=True)
+        if answer.get("text"):
+            answer["_hook_deadline"] = started + HOOK_SECONDS
+            if remote is not None:
+                client.acknowledge(answer, HOME)
+            else:
+                _ack_daemon(answer)
     except Exception:
         return  # never block the prompt
 
@@ -1333,25 +1883,36 @@ def _upload() -> dict[str, Any]:
         _release_sync(lock)
 
 
-_TOOL = {
-    "name": "neocore_recall",
-    "description": (
-        "Search NeoCore memory: what was said and decided in earlier Claude Code and Codex "
-        "sessions on this machine (projects, decisions, preferences, deadlines). Returns dated "
-        "excerpts. Call it at the start of a task and whenever earlier context may matter."
-    ),
-    "inputSchema": {
-        "type": "object",
-        "properties": {"query": {"type": "string", "description": "what to look up"}},
-        "required": ["query"],
-    },
-}
+def _tool_daemon(name: str, arguments: Any) -> dict[str, Any] | None:
+    """One memory tool call on the warm daemon: ``{"text", "is_error"}``. A daemon that is down
+    is started and, while it warms up, waited for (``DAEMON_WAIT``); None when there is still
+    none, so the caller answers from its own copy."""
+    end = time.monotonic() + DAEMON_WAIT
+    started = False
+    while True:
+        try:
+            reply = _daemon_call({"action": "tool", "name": name, "arguments": arguments},
+                                 RecallDeadline(time.monotonic() + TOOL_SECONDS + 1.0, 0.0))
+        except (OSError, ValueError, KeyError) as error:
+            return {"text": f"(memory unavailable: {type(error).__name__})", "is_error": True}
+        if reply is not None and reply.get("error") != "starting":
+            if reply.get("error"):  # busy, or the call outlived its time
+                return {"text": f"(memory unavailable: {reply['error']})", "is_error": True}
+            return {"text": str(reply.get("text") or ""), "is_error": bool(reply.get("is_error"))}
+        if reply is None and not started:
+            _detached("serve")
+            started = True
+        if time.monotonic() >= end:
+            return None
+        time.sleep(0.25)  # a local file check while the daemon warms up; no model is called
 
 
 def mcp_server() -> None:
+    """stdio MCP server with the memory tools (``neocore.shared.tools``): with ``remote.json``
+    each call goes to the memory server, under this device's key and scopes; otherwise to the
+    warm local daemon, which keeps the one loaded copy of the index for every chat."""
     from neocore.shared import client
 
-    memory_box: dict[str, DevMemory] = {}
     remote = client.load(HOME)
 
     def background() -> None:
@@ -1371,40 +1932,50 @@ def mcp_server() -> None:
     if remote is not None:
         _remote_mcp(remote)
         return
+    from neocore.shared.tools import TOOLS, ToolError, Tools, protocol_version
+
+    own: dict[str, Any] = {}  # this process's own copy, only when no daemon can start
+
+    def call(name: str, arguments: Any) -> tuple[str, bool]:
+        if name == "neocore_recall":  # the single tool of 0.2: a search by another name
+            name = "neocore_search"
+        try:
+            answer = _tool_daemon(name, arguments)
+            if answer is not None:
+                own.clear()
+                return answer["text"], answer["is_error"]
+            if "tools" not in own:
+                own["tools"] = Tools(DevMemory())
+            text = own["tools"].call(name, arguments, scopes=frozenset({SCOPE}),
+                                     write_scope=SCOPE, device="this-computer")
+            return text, False
+        except (ToolError, PermissionError) as error:
+            return str(error), True
+        except Exception as error:  # report, never crash the host
+            return f"(memory unavailable: {type(error).__name__})", True
+
     for line in sys.stdin:
         try:
             request = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(request, dict):
+            continue
         method, ident = request.get("method"), request.get("id")
         if ident is None:
             continue  # notification
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
         if method == "initialize":
             result: dict[str, Any] = {
-                "protocolVersion": (request.get("params") or {}).get("protocolVersion")
-                or "2024-11-05",
+                "protocolVersion": protocol_version(params.get("protocolVersion")),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "neocore", "version": __version__},
             }
         elif method == "tools/list":
-            result = {"tools": [_TOOL]}
+            result = {"tools": TOOLS}
         elif method == "tools/call":
-            params = request.get("params") or {}
-            query = str((params.get("arguments") or {}).get("query") or "")
-            try:
-                # The warm daemon serves every host; loading a second copy of the index and
-                # embedder here costs ~800 MB per Codex session.
-                answer = _ask_daemon(query, "", "codex")
-                if answer is None:
-                    _detached("serve")  # warm for the next call
-                text = (answer or {}).get("text") or ""
-                if not text:
-                    memory = memory_box.setdefault("m", DevMemory())
-                    text = memory.recall(query)
-                text = text or "(nothing relevant in memory)"
-            except Exception as error:  # report, never crash the host
-                text = f"(memory unavailable: {type(error).__name__})"
-            result = {"content": [{"type": "text", "text": text}]}
+            text, failed = call(str(params.get("name") or ""), params.get("arguments") or {})
+            result = {"content": [{"type": "text", "text": text}], "isError": failed}
         elif method == "ping":
             result = {}
         else:
@@ -1457,6 +2028,7 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("stats").add_argument("--days", type=float, default=7.0)
     sub.add_parser("reopen-history").add_argument("--calls", type=int, default=0)
     sub.add_parser("lessons").add_argument("--calls", type=int, default=2)
+    sub.add_parser("profile").add_argument("--rebuild", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "sync":
         print(json.dumps(_sync(), indent=1))
@@ -1508,6 +2080,19 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(dev_lessons.backfill(
             memory.store.rows, memory.recall_engine.add_fact,
             memory.home, ask, max_calls=args.calls), indent=1))
+    elif args.command == "profile":
+        from neocore.assistant import profile as dev_profile
+
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]  # Windows console
+        memory = DevMemory()
+        if args.rebuild:
+            ask = _ask(memory.config)
+            if ask is None:
+                sys.exit("no model configured: install the Codex or Claude Code CLI, or set llm")
+            print(json.dumps(dev_profile.build(memory.store.rows, memory.home, ask, {SCOPE},
+                                               force=True), indent=1))
+        print(dev_profile.get(memory.home, {SCOPE}) or "No briefing yet: the next sync writes "
+              "it from the memory's facts (it needs formed facts and a model).")
     elif args.command == "status" and (remote := _remote_status()) is not None:
         print(json.dumps(remote, indent=1))
     elif args.command == "status":
