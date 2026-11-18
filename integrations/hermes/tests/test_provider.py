@@ -26,6 +26,7 @@ _spec.loader.exec_module(plugin)
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # the caller's profile = the provider's
+    monkeypatch.setenv("NEOCORE_HOME", str(tmp_path / "neocore-home"))  # never the machine's own
     folder = tmp_path / plugin.DATA_DIR
     folder.mkdir()
     (folder / "config.json").write_text(json.dumps({"dense_recall": False}))
@@ -160,4 +161,85 @@ def test_config_round_trip(home):
     assert keys == set(plugin.DEFAULTS)
     provider.save_config({"scope": "user", "budget_chars": "12000", "junk": 1}, str(home))
     config = plugin.load_config(home / plugin.DATA_DIR)
-    assert config == {"scope": "user", "budget_chars": 12000, "dense_recall": False}
+    assert config == {"scope": "user", "budget_chars": 12000, "dense_recall": False,
+                      "neosift": "auto"}
+
+
+# -- NeoSift (a stand-in scorer: the real one needs a graphics card) ----------------------------
+
+
+def start_sifted(home, scorer, session="s1"):
+    provider = plugin.NeoCoreMemoryProvider()
+    provider._sift_scorer = scorer
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    manager.initialize_all(session_id=session, hermes_home=str(home), platform="cli")
+    return manager, provider
+
+
+def remember(home):
+    manager, provider = start(home, "s1")
+    turn(manager, provider, "I moved to Lisbon in May for the Feedzai job.", "Congratulations!")
+    turn(manager, provider, "My sister lives in Lisbon too, she paints murals.", "Lovely.")
+    manager.shutdown_all()
+
+
+def test_neosift_keeps_only_the_memories_that_help(home):
+    remember(home)
+    seen = []
+
+    def scorer(prompt, context, texts):
+        seen.append(len(texts))
+        return [0.95 if "Feedzai" in t else 0.05 for t in texts]
+
+    manager, provider = start_sifted(home, scorer, "s2")
+    recalled = provider.prefetch("Where do I work in Lisbon?", session_id="s2")
+    assert seen and seen[0] >= 2  # it read the wide pool
+    assert "Feedzai" in recalled and "murals" not in recalled
+    assert provider.recall_status().count == 1
+    manager.shutdown_all()
+
+
+def test_neosift_can_say_nothing_helps(home):
+    remember(home)
+    manager, provider = start_sifted(home, lambda p, c, texts: [0.01] * len(texts), "s2")
+    assert provider.prefetch("Where do I work in Lisbon?", session_id="s2") == ""
+    manager.shutdown_all()
+
+
+def test_neosift_failing_falls_back_to_plain_recall(home):
+    remember(home)
+
+    def broken(prompt, context, texts):
+        raise OSError("not answering")
+
+    manager, provider = start_sifted(home, broken, "s2")
+    recalled = provider.prefetch("Where do I work in Lisbon? Feedzai murals", session_id="s2")
+    assert "Feedzai" in recalled and "murals" in recalled
+    manager.shutdown_all()
+
+
+def test_neosift_reads_the_last_turn(home):
+    remember(home)
+    contexts = []
+
+    def scorer(prompt, context, texts):
+        contexts.append(context)
+        return [0.9] * len(texts)
+
+    manager, provider = start_sifted(home, scorer, "s2")
+    turn(manager, provider, "Tell me about my job.", "You work at Feedzai.", session="s2")
+    provider.prefetch("and where is it based, Lisbon?", session_id="s2")
+    assert contexts[-1][-1] == {"speaker": "Assistant", "text": "You work at Feedzai."}
+    manager.shutdown_all()
+
+
+def test_neosift_off_is_never_asked(home):
+    remember(home)
+    (home / plugin.DATA_DIR / "config.json").write_text(
+        json.dumps({"dense_recall": False, "neosift": "off"}))
+    asked = []
+    manager, provider = start_sifted(home, lambda p, c, t: asked.append(1) or [0.0] * len(t), "s2")
+    assert "Feedzai" in provider.prefetch("Where do I work in Lisbon? Feedzai", session_id="s2")
+    assert not asked
+    manager.shutdown_all()

@@ -19,7 +19,7 @@ corrected) is enforced at recall time, not left to the model.
 | LoCoMo (10 conversations, 1,540 questions) | **87.5%** (gpt-4.1-mini reader) |
 | LongMemEval-S (500 questions) | **89.6%** (gpt-4.1-mini reader, gpt-4o judge) |
 | Governance: leaks under maximal pressure | **0 leaks** in 1,540 questions (an ungoverned store leaked on all 1,540) |
-| Model calls per recall | **0**: p50 22 ms on a laptop CPU, offline |
+| Model calls per recall | **0**: p50 22 ms, offline |
 
 All numbers come from this repository's code (`evals/`), run through the public package. See
 [Evals](#evals) for the setup and the honest caveats.
@@ -58,7 +58,7 @@ neocore setup
 
 `neocore setup` does four things:
 
-- downloads the bge-small embedder (~35 MB, CPU);
+- downloads the bge-small embedder (~35 MB);
 - adds a prompt hook and a stop hook to `~/.claude/settings.json` (merged, backup kept);
 - adds an MCP server and the same hooks to `~/.codex/config.toml` (inside marked lines);
 - writes `~/.neocore/config.json`.
@@ -118,9 +118,9 @@ against 74% for Jev. On 885 real prompts graded *after* their replies, the defau
 injected 5.7 memories per prompt and caught 66% of the memories the replies needed. Raising the
 cut-off trades needed memories away about as fast as it saves space.
 
-**It needs a graphics card.** One prompt (48 candidates) takes 0.07 s on an RTX 3080, but 7-8 s
-on a desktop processor, longer than a prompt can wait. So `neocore setup` installs it only when
-it finds an NVIDIA card or Apple silicon, and only if a speed check passes:
+**It runs on your graphics card.** One prompt (48 candidates) takes 0.07 s on an RTX 3080.
+`neocore setup` installs it when it finds an NVIDIA card or Apple silicon, and only if a speed
+check passes:
 
 ```bash
 neocore sift install      # or: neocore setup (does it when a graphics card is found)
@@ -294,8 +294,8 @@ NeoCore 0.2 is beta.
 - **Battle-tested scale is modest.** The assistant integration has run daily on one developer's
   Claude Code and Codex history (thousands of turns), and the engine has run behind three
   production assistants. Scale tests on large corpora are still to come.
-- **NeoSift needs a graphics card.** Machines without one use the hosted scorer or unfiltered
-  recall. A faster model for processors is a future training round.
+- **NeoSift runs on a graphics card** (NVIDIA or Apple silicon). Other machines use the hosted
+  scorer or unfiltered recall.
 - **NeoSift has learned mostly from one developer's coding prompts so far.** On two business
   assistants' prompts it agreed with its teacher less well (0.68 against 0.80, an earlier
   round). Opt-in sharing is how it learns everyone's.

@@ -2,8 +2,10 @@
 
 Every finished turn is kept verbatim in one SQLite file inside the profile's home. Before each turn
 NeoCore recalls the dated excerpts that turn needs, with zero model calls (BM25, plus a small local
-embedding model on CPU once it is downloaded). Permission is decided before ranking: a messaging
-chat recalls only its own memory unless the ``scope`` setting says otherwise.
+embedding model once it is downloaded). On a machine with a graphics card (NVIDIA, or Apple
+silicon) NeoSift, NeoCore's own relevance model, then reads the turn and the recalled memories
+locally and keeps only the ones that help. Permission is decided before ranking: a messaging chat
+recalls only its own memory unless the ``scope`` setting says otherwise.
 
 Settings live in ``$HERMES_HOME/neocore/config.json`` (``hermes memory setup`` writes them).
 """
@@ -13,9 +15,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +37,13 @@ LABEL = "NeoCore"
 DATA_DIR = "neocore"  # inside the profile's HERMES_HOME
 EMBEDDER = "bge-small-en-v1.5-onnx-Q"
 SCOPES = ("auto", "profile", "chat", "user")
-DEFAULTS: dict[str, Any] = {"scope": "auto", "budget_chars": 8000, "dense_recall": True}
+SIFT_MODES = ("auto", "off")
+DEFAULTS: dict[str, Any] = {"scope": "auto", "budget_chars": 8000, "dense_recall": True,
+                            "neosift": "auto"}
+# NeoSift scores a wide pool and keeps the best: recall this many excerpts for it to read.
+SIFT_POOL: dict[str, Any] = {"top_spans": 48, "top_facts": 0, "budget_bytes": 40_000,
+                             "focus_turns": 2}
+SIFT_RETRY_DAYS = 7  # after a failed NeoSift install, try again this much later
 PROFILE_SCOPE = "hermes"
 SYSTEM_NOTE = (
     "NeoCore long-term memory is on. Before a turn, dated excerpts from earlier conversations "
@@ -103,7 +113,58 @@ def load_config(folder: Path) -> dict[str, Any]:
         config["budget_chars"] = DEFAULTS["budget_chars"]
     dense = config["dense_recall"]
     config["dense_recall"] = dense is True or str(dense).lower() in ("true", "1", "yes", "on")
+    config["neosift"] = str(config["neosift"]).lower()
+    if config["neosift"] not in SIFT_MODES:
+        config["neosift"] = DEFAULTS["neosift"]
     return config
+
+
+def sift_home() -> Path:
+    """NeoSift's install is shared with NeoCore's other hosts (Claude Code, Codex) on the machine."""
+    return Path(os.environ.get("NEOCORE_HOME") or Path.home() / ".neocore")
+
+
+_SIFT_LOCK = threading.Lock()
+_SIFT_BUSY: set[str] = set()
+
+
+def install_sift(home: Path, marker: Path) -> None:
+    """Install NeoSift once when this machine has a graphics card (its own Python environment and
+    the pinned model, ~2-3 GB; it is switched on only if it passes its speed check). A failed try
+    is not repeated for ``SIFT_RETRY_DAYS``. Recall works as before meanwhile."""
+    key = str(home.resolve())
+    with _SIFT_LOCK:
+        if key in _SIFT_BUSY:
+            return
+        _SIFT_BUSY.add(key)
+    try:
+        from neocore.assistant import neosift
+
+        if neosift.installed(home):
+            return
+        try:
+            last = json.loads(marker.read_text(encoding="utf-8"))
+            if time.time() - float(last.get("at", 0)) < SIFT_RETRY_DAYS * 86400:
+                return
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        device = neosift.gpu()
+        if not device:
+            return
+        logger.info("NeoCore: graphics card found (%s); installing NeoSift in the background",
+                    device)
+        try:
+            neosift.install(home)
+            marker.unlink(missing_ok=True)
+            neosift.ensure(home)
+            logger.info("NeoCore: NeoSift is ready; recall is filtered from now on")
+        except Exception as error:  # noqa: BLE001 - recall keeps working unfiltered
+            marker.write_text(json.dumps({"at": time.time(), "error": str(error)[:300]}),
+                              encoding="utf-8")
+            logger.warning("NeoCore: NeoSift not installed (%s); recall stays unfiltered", error)
+    finally:
+        with _SIFT_LOCK:
+            _SIFT_BUSY.discard(key)
 
 
 def scope_for(setting: str, context: dict[str, Any]) -> str:
@@ -185,6 +246,10 @@ class NeoCoreMemoryProvider(MemoryProvider):
         self._jobs: queue.Queue[Any] | None = None
         self._worker: threading.Thread | None = None
         self._status: RecallStatus | None = None
+        # NeoSift: the last finished turn per session (it reads the end of the reply before),
+        # and a scorer tests can put in its place.
+        self._last: dict[str, tuple[str, str]] = {}
+        self._sift_scorer: Any = None
 
     # -- identity ----------------------------------------------------------------------------
 
@@ -237,6 +302,16 @@ class NeoCoreMemoryProvider(MemoryProvider):
         self._worker = spawn_context_thread(self._work, name="neocore-writer")
         self._worker.start()
         self._jobs.put(("index",))
+        if self._config["neosift"] == "auto" and self._sift_scorer is None:
+            from neocore.assistant import neosift
+
+            home = sift_home()
+            if neosift.installed(home):
+                # Start the local server now, so the first real turn is already filtered.
+                spawn_context_thread(neosift.ensure, name="neocore-sift", args=(home,)).start()
+            elif self._writes:
+                spawn_context_thread(install_sift, name="neocore-sift-install",
+                                     args=(home, self._folder / "neosift-install.json")).start()
 
     def shutdown(self) -> None:
         if self._jobs is not None and self._worker is not None:
@@ -260,8 +335,21 @@ class NeoCoreMemoryProvider(MemoryProvider):
         session = session_id or self._session_id
         with self._held_lock:
             held = sorted(self._held.get(session, ()))
+        budget = self._config["budget_chars"]
+        if self._sift_ready():
+            try:
+                sifted = self._sift(query, held, session, budget)
+            except Exception as error:  # noqa: BLE001 - unfiltered recall below instead
+                logger.warning("NeoCore: NeoSift step failed (%s); recall unfiltered", error)
+                sifted = None
+            if sifted is not None:
+                rendered, count = sifted
+                if not count:
+                    return ""  # NeoSift read them all: nothing recalled helps with this turn
+                self._status = RecallStatus(provider_label=LABEL, count=count)
+                return rendered
         try:
-            result = self._recall(query, held, self._config["budget_chars"])
+            result = self._recall(query, held, budget)
         except Exception as error:  # noqa: BLE001 - a recall failure must never fail the turn
             logger.warning("NeoCore recall failed: %s", error)
             return ""
@@ -270,6 +358,49 @@ class NeoCoreMemoryProvider(MemoryProvider):
             return ""
         self._status = RecallStatus(provider_label=LABEL, count=count)
         return result.rendered
+
+    def _sift_ready(self) -> bool:
+        if self._config["neosift"] != "auto":
+            return False
+        if self._sift_scorer is not None:
+            return True
+        from neocore.assistant import neosift
+
+        return neosift.installed(sift_home())
+
+    def _sift(self, query: str, held: list[str], session: str,
+              budget: int) -> tuple[str, int] | None:
+        """Recall wide, let NeoSift score every excerpt against this turn, keep the ones that
+        help (best first, within the budget). ``None`` when NeoSift could not answer: the
+        caller then recalls unfiltered, as on a machine without NeoSift."""
+        from neocore.assistant import neosift
+        from neocore.assistant.filter import Gate
+        from neocore.recall import _render
+
+        with self._engine_lock:
+            result = self._engine.recall(query, allowed_scopes={self._scope},
+                                         exclude_evidence_ids=held, **SIFT_POOL)
+        excerpts: dict[str, list[Any]] = {}
+        for span in result.spans:
+            excerpts.setdefault(span.evidence_id, []).append(span)
+        if not excerpts:
+            return "", 0
+        items = [{"kind": "excerpt", "id": evidence_id, "spans": spans,
+                  "text": "\n".join(s.text for s in spans)}
+                 for evidence_id, spans in excerpts.items()]
+        context: list[dict[str, str]] = []
+        if session in self._last:
+            user, assistant = self._last[session]
+            context = [{"speaker": "User", "text": user[:20_000]},
+                       {"speaker": "Assistant", "text": assistant[:20_000]}]
+        gate = Gate(sift_home(), {"relevance": "filter", "relevance_scorer": "neosift",
+                                  "learning": "off", **neosift.POLICY}, scorer=self._sift_scorer)
+        keep, _record = gate.select(query, context, items, "hermes")
+        if keep is None:
+            return None
+        rendered, delivered, _facts = _render([s for item in keep for s in item["spans"]], budget)
+        count = len({s.evidence_id for s in delivered})
+        return (rendered, count) if count and rendered.strip() else ("", 0)
 
     def recall_status(self) -> RecallStatus | None:
         return self._status
@@ -295,6 +426,7 @@ class NeoCoreMemoryProvider(MemoryProvider):
         metadata = {"source": "hermes"}
         if author.get("id"):
             metadata["author_id"] = str(author["id"])
+        self._last[session_id or self._session_id] = (user, assistant)
         self._jobs.put(("turn", session_id or self._session_id, user, assistant, metadata))
 
     def _work(self) -> None:
@@ -411,8 +543,14 @@ class NeoCoreMemoryProvider(MemoryProvider):
              "description": "Most recalled text added before a turn, in bytes."},
             {"key": "dense_recall", "type": "boolean", "default": DEFAULTS["dense_recall"],
              "description": "Also match meaning, not only words: downloads a 65 MB embedding "
-                            "model (bge-small, pinned by SHA-256) from Hugging Face once; it runs "
-                            "on CPU. Off: word matching only, no download."},
+                            "model (bge-small, pinned by SHA-256) from Hugging Face once. Off: "
+                            "word matching only, no download."},
+            {"key": "neosift", "default": DEFAULTS["neosift"], "choices": list(SIFT_MODES),
+             "description": "NeoSift, NeoCore's own relevance model: with a graphics card "
+                            "(NVIDIA or Apple silicon) it reads each turn and the recalled "
+                            "memories locally and keeps only the ones that help. auto: installs "
+                            "it once in the background when a graphics card is found (~2-3 GB, "
+                            "shared with NeoCore for Claude Code and Codex). off: never."},
         ]
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
