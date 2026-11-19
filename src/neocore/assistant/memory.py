@@ -363,7 +363,14 @@ def last_turn(transcript: str, host: str) -> Turn | None:
     path = Path(transcript) if transcript else None
     if path is None or not path.is_file():
         return None
-    reader = codex_turns if host == "codex" else claude_turns
+    from neocore.assistant import spool
+
+    if host == "codex":
+        reader = codex_turns
+    elif path.parent.parent.name == spool.FOLDER:  # a turn file NeoCore's own hooks write
+        reader = spool.reader(host)
+    else:
+        reader = claude_turns
     try:
         size = path.stat().st_size
         for tail in TAIL_BYTES:
@@ -508,12 +515,19 @@ class ReadGuard:
 
 def transcript_sources() -> list[tuple[str, Path, Callable[[Path, int], Iterator[tuple[Turn | None, int]]]]]:
     """Where each host keeps its transcripts, and how to read them."""
+    from neocore.assistant import spool
+
     codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    return [
+    sources = [
         ("claude-code", Path.home() / ".claude" / "projects", claude_turns),
         ("codex", codex / "sessions", codex_turns),
         ("codex", codex / "archived_sessions", codex_turns),
     ]
+    # Gemini CLI, Cursor, Copilot CLI, opencode ...: turns their NeoCore hooks wrote.
+    turns = HOME / spool.FOLDER
+    if turns.is_dir():
+        sources += [(f.name, f, spool.reader(f.name)) for f in sorted(turns.iterdir()) if f.is_dir()]
+    return sources
 
 
 _LOAD = object()  # DevMemory(embedder=...): load the one config.json names
@@ -586,7 +600,7 @@ class DevMemory:
         after each transcript (``sync`` renews its lock with it)."""
         state_path = self.home / "offsets.json"
         state = _read_json(state_path)
-        counts = {"claude-code": 0, "codex": 0}
+        counts: dict[str, int] = {"claude-code": 0, "codex": 0}
         guard = ReadGuard(self.home)
         for host, root, reader in transcript_sources():
             if not root.is_dir():
@@ -599,7 +613,7 @@ class DevMemory:
                     continue
                 for turn, after in reader(path, start):
                     if turn is not None:
-                        counts[host] += self.capture(turn)
+                        counts[host] = counts.get(host, 0) + self.capture(turn)
                     state[key] = after
                 guard.done(key, start, int(state.get(key, start)))
                 _write_json(state_path, state)
@@ -1823,6 +1837,73 @@ def _log_miss(host: str, status: str, request_id: str = "") -> None:
                       **({"request_id": request_id} if request_id else {})})
 
 
+def recall_for_prompt(host: str, prompt: str, session: str, transcript: str, *,
+                      started: float, deadline: float, request_id: str,
+                      replaced: int = 0) -> tuple[dict[str, Any], Any] | None:
+    """What a prompt hook adds for ``prompt``: ``({"text", "notice", ...}, remote)``, or None
+    when the prompt asks for nothing (too short, a machine message) or no daemon answers yet.
+    Shared by every host's prompt hook; each prints the answer in its own host's shape and then
+    calls ``confirm_delivery``."""
+    from neocore.recall import query_terms
+
+    # "continue", "make it live", "bro how many times????": the session already holds the
+    # context, and recall on two words only adds noise. A chat's first message still asks:
+    # it gets the user's briefing. No words at all: nothing to ask with.
+    if not prompt or is_machine_prompt(prompt) or (
+            len(query_terms(prompt)) < MIN_PROMPT_TERMS
+            and not _first_prompt(transcript, host)):
+        return None
+    from neocore.shared import client
+
+    receipts = _read_json(HOME / "config.json").get("delivery_receipts", True) is not False
+    timing = {"hook_parse": round((time.monotonic() - started) * 1000)}
+    remote = client.load(HOME)
+    if remote is not None:  # the memory lives on a server (``neocore connect``)
+        answer = client.ask(remote, HOME, prompt, session, host, transcript,
+                            seconds=max(0.0, deadline - time.time()),
+                            request_id=request_id, ack=receipts,
+                            unicode_replacements=replaced, timing=timing)
+        source = "remote"
+        if not answer.get("error"):
+            from neocore.assistant.filter import count_miss
+
+            count_miss(HOME, missed=False)  # the daemon does this itself in local mode
+    else:
+        local = _ask_daemon(prompt, session, host, transcript, notices=host in NOTICE_HOSTS,
+                            request_id=request_id, deadline=deadline,
+                            unicode_replacements=replaced, protocol=2 if receipts else 1,
+                            timing=timing)
+        if local is None:
+            _detached("serve")  # warm up for the next prompt; never delay this one
+            _log_miss(host, "no-daemon", request_id)
+            return None
+        answer, source = local, "daemon"
+    if answer.get("error"):
+        _log_miss(host, f"{source}-{answer['error']}", request_id)
+        if answer["error"] != "starting":  # after a release or an idle night: expected
+            from neocore.assistant.filter import count_miss, notice
+
+            count_miss(HOME, missed=True)
+            if host in NOTICE_HOSTS:
+                answer["notice"] = notice(HOME)
+    if answer.get("_deadline") and time.monotonic() >= float(answer["_deadline"]):
+        return None  # too late: the host may already have gone on without it
+    return answer, remote
+
+
+def confirm_delivery(answer: dict[str, Any], remote: Any, started: float) -> None:
+    """After the hook printed the recalled text: tell the daemon (or server) it reached the chat."""
+    if not answer.get("text"):
+        return
+    answer["_hook_deadline"] = started + HOOK_SECONDS
+    if remote is not None:
+        from neocore.shared import client
+
+        client.acknowledge(answer, HOME)
+    else:
+        _ack_daemon(answer)
+
+
 def claude_prompt_hook(host: str = "claude-code") -> None:
     """``UserPromptSubmit`` hook for Claude Code, and for Codex (same event shape) with
     ``host="codex"``: the recalled memory rides along with the prompt. The answer is used only
@@ -1831,8 +1912,6 @@ def claude_prompt_hook(host: str = "claude-code") -> None:
     deadline = time.time() + ASK_SECONDS
     request_id = uuid.uuid4().hex
     try:
-        from neocore.recall import query_terms
-
         if os.environ.get("NEOCORE_DISABLED"):
             return
         event = json.loads(sys.stdin.read() or "{}")
@@ -1840,48 +1919,12 @@ def claude_prompt_hook(host: str = "claude-code") -> None:
         prompt = prompt.strip()
         if host == "codex":
             prompt = codex_user_request(prompt)  # the user's words, without attachment wrappers
-        session, transcript = str(event.get("session_id") or ""), str(
-            event.get("transcript_path") or "")
-        # "continue", "make it live", "bro how many times????": the session already holds the
-        # context, and recall on two words only adds noise. A chat's first message still asks:
-        # it gets the user's briefing. No words at all: nothing to ask with.
-        if not prompt or is_machine_prompt(prompt) or (
-                len(query_terms(prompt)) < MIN_PROMPT_TERMS
-                and not _first_prompt(transcript, host)):
+        found = recall_for_prompt(host, prompt, str(event.get("session_id") or ""),
+                                  str(event.get("transcript_path") or ""), started=started,
+                                  deadline=deadline, request_id=request_id, replaced=replaced)
+        if found is None:
             return
-        from neocore.shared import client
-
-        receipts = _read_json(HOME / "config.json").get("delivery_receipts", True) is not False
-        timing = {"hook_parse": round((time.monotonic() - started) * 1000)}
-        remote = client.load(HOME)
-        if remote is not None:  # the memory lives on a server (``neocore connect``)
-            answer = client.ask(remote, HOME, prompt, session, host, transcript,
-                                seconds=max(0.0, deadline - time.time()),
-                                request_id=request_id, ack=receipts,
-                                unicode_replacements=replaced, timing=timing)
-            source = "remote"
-            if not answer.get("error"):
-                from neocore.assistant.filter import count_miss
-
-                count_miss(HOME, missed=False)  # the daemon does this itself in local mode
-        else:
-            local = _ask_daemon(prompt, session, host, transcript, notices=host in NOTICE_HOSTS,
-                                request_id=request_id, deadline=deadline,
-                                unicode_replacements=replaced, protocol=2 if receipts else 1,
-                                timing=timing)
-            if local is None:
-                _detached("serve")  # warm up for the next prompt; never delay this one
-                _log_miss(host, "no-daemon", request_id)
-                return
-            answer, source = local, "daemon"
-        if answer.get("error"):
-            _log_miss(host, f"{source}-{answer['error']}", request_id)
-            if answer["error"] != "starting":  # after a release or an idle night: expected
-                from neocore.assistant.filter import count_miss, notice
-
-                count_miss(HOME, missed=True)
-                if host in NOTICE_HOSTS:
-                    answer["notice"] = notice(HOME)
+        answer, remote = found
         output: dict[str, Any] = {}
         if answer.get("text"):
             output["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit",
@@ -1890,15 +1933,8 @@ def claude_prompt_hook(host: str = "claude-code") -> None:
             output["systemMessage"] = answer["notice"]  # shown to the user, not the model
         if not output:
             return
-        if answer.get("_deadline") and time.monotonic() >= float(answer["_deadline"]):
-            return  # too late: the host may already have gone on without it
         print(json.dumps(output), flush=True)
-        if answer.get("text"):
-            answer["_hook_deadline"] = started + HOOK_SECONDS
-            if remote is not None:
-                client.acknowledge(answer, HOME)
-            else:
-                _ack_daemon(answer)
+        confirm_delivery(answer, remote, started)
     except Exception:
         return  # never block the prompt
 

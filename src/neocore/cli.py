@@ -1,6 +1,8 @@
 """``neocore``: set up shared memory for Claude Code and Codex, then run its hooks.
 
     neocore setup [--dry-run] [--no-embedder] [--no-sift] [--no-claude] [--no-codex]
+                  [--tools gemini-cli,cursor,copilot-cli,opencode | none]
+    neocore mcp-config                                   (the MCP server entry for any other tool)
     neocore sift install [--force] | remove | status   (NeoSift, the local relevance filter)
     neocore share on | off | status | send | delete     (opt-in: help train NeoSift)
     neocore rules add | remove | list | check | build | stats | off | on   (``neocore rules -h``)
@@ -15,6 +17,8 @@
 Setup only edits what it names: ``~/.claude/settings.json`` (two hooks, merged, a backup kept)
 and ``~/.codex/config.toml`` (an MCP server and two hooks inside marked lines). Codex asks you
 to trust new hooks the first time they run; NeoCore never marks them trusted for you.
+Other AI tools found on this machine (Gemini CLI, Cursor, GitHub Copilot CLI, opencode) get
+what their hooks allow, merged into their own settings files (``neocore.tools``).
 
 Rules check (``neocore rules``): its hooks are installed only while you have rules, and only the
 ones your rules need. ``neocore rules add/remove/build`` bring them up to date on every host
@@ -34,7 +38,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from neocore import llm
+from neocore import llm, tools
 from neocore.assistant import memory, neosift, rules, share
 
 EMBEDDER = "bge-small-en-v1.5-onnx-Q"
@@ -308,6 +312,10 @@ def setup(args: argparse.Namespace) -> None:
         plan.append(f"Claude Code hooks in {_claude_settings()}")
     if not args.no_codex:
         plan.append(f"Codex MCP server and hooks in {_codex_config()}")
+    others = _other_tools(args.tools)
+    for tool in others:
+        plan.append(f"{tool}: {tools.WHAT[tool]}, in "
+                    + ", ".join(str(path) for path in tools.files(tool)))
     plans = _rule_plans()
     if any(plans.values()):
         plan.append("rules check hooks: " + "; ".join(
@@ -337,6 +345,11 @@ def setup(args: argparse.Namespace) -> None:
         config["share"] = _ask_share()
     memory._write_json(config_path, config)
     install_hooks(claude=not args.no_claude, codex=not args.no_codex)
+    for tool in others:
+        try:
+            tools.install(tool)
+        except (OSError, ValueError) as error:
+            print(f"  {tool} not set up ({error}); `neocore mcp-config` prints the entry to add")
     print("Done. Your next prompt starts the memory daemon; existing Claude Code and Codex "
           "history is read on the first sync (`neocore sync`).")
     if not args.no_codex:
@@ -353,6 +366,8 @@ def uninstall(_: argparse.Namespace) -> None:
     if path.exists():
         text = without_codex_block(path.read_text(encoding="utf-8"))
         path.write_text(without_codex_block(text, RULES_BEGIN, RULES_END), encoding="utf-8")
+    for tool in tools.TOOLS:
+        tools.uninstall(tool)
     print(f"Hooks removed. Your memory is still in {memory.HOME}; delete that folder to erase it.")
 
 
@@ -374,11 +389,23 @@ def doctor(_: argparse.Namespace) -> None:
         "codex block": BEGIN in (_codex_config().read_text(encoding="utf-8")
                                  if _codex_config().exists() else ""),
         "daemon running": bool(memory._read_json(memory.HOME / "daemon.json")),
+        "other tools set up": {tool: tools.status(tool) for tool in tools.TOOLS},
         "rules check": {**rules.summary(),
                         "claude-code hooks installed": RULES_MODULE in claude,
                         "codex hooks installed": RULES_BEGIN in codex},
     }
     print(json.dumps(checks, indent=1))
+
+
+def _other_tools(chosen: str | None) -> list[str]:
+    """``--tools``: a comma list, ``none``, or (not given) every supported tool found here."""
+    if chosen is None:
+        return tools.installed()
+    names = [n.strip() for n in chosen.split(",") if n.strip() and n.strip() != "none"]
+    unknown = [n for n in names if n not in tools.TOOLS]
+    if unknown:
+        sys.exit(f"unknown tool {', '.join(unknown)}; known: {', '.join(tools.TOOLS)}")
+    return names
 
 
 def _ask_share() -> bool:
@@ -490,6 +517,14 @@ def main(argv: list[str] | None = None) -> None:
     if argv[:1] == ["memory"]:
         memory.main(argv[1:] or ["-h"])
         return
+    if argv[:1] == ["host-hook"]:
+        from neocore.assistant import hosts
+
+        hosts.main(argv[1:])
+        return
+    if argv[:1] == ["mcp-config"]:
+        print(json.dumps(tools.mcp_config(), indent=2))
+        return
     if argv[:1] == ["rules"]:
         sys.exit(rules.manage(argv[1:] or ["-h"], on_change=refresh_rule_hooks))
     if "--plugin" in argv[1:]:
@@ -507,6 +542,9 @@ def main(argv: list[str] | None = None) -> None:
     one.add_argument("--no-sift", action="store_true", help="skip NeoSift even with a GPU")
     one.add_argument("--no-claude", action="store_true")
     one.add_argument("--no-codex", action="store_true")
+    one.add_argument("--tools", default=None,
+                     help="other AI tools to set up: a comma list of " + ", ".join(tools.TOOLS)
+                          + ", or none (default: every one found on this machine)")
     sub.add_parser("uninstall", help="remove the hooks (keeps your memory)")
     sub.add_parser("doctor", help="check the installation")
     one = sub.add_parser("sift", help="NeoSift, the local relevance filter (graphics card)")

@@ -7,8 +7,9 @@
 **Long-term memory for AI assistants that recalls only what the moment needs, and never what it
 shouldn't.**
 
-NeoCore gives every AI harness you use one memory: Claude Code, Codex and Hermes read and write
-the same memory of everything you told them, on all your machines. Tell Codex something at your
+NeoCore gives every AI harness you use one memory: Claude Code, Codex, Hermes, Gemini CLI,
+Cursor, GitHub Copilot CLI and opencode read and write the same memory of everything you told
+them, on all your machines. Tell Codex something at your
 desk; Hermes knows it on Telegram tonight. It can also be dropped into any assistant as a Python
 library. Recall makes **zero LLM calls**: it is local,
 takes milliseconds and costs nothing (the optional [NeoSift](#neosift-the-local-relevance-filter)
@@ -66,7 +67,9 @@ neocore setup
 - downloads the bge-small embedder (~35 MB);
 - adds a prompt hook and a stop hook to `~/.claude/settings.json` (merged, backup kept);
 - adds an MCP server and the same hooks to `~/.codex/config.toml` (inside marked lines);
-- writes `~/.neocore/config.json`.
+- writes `~/.neocore/config.json`;
+- sets up any [other AI tool](#quick-start-gemini-cli-cursor-copilot-cli-opencode) it finds on
+  the machine.
 
 Codex will ask you to trust the new hooks the first time they run. `neocore uninstall` removes
 the hooks and keeps your memory. `neocore doctor` checks the install. Run
@@ -279,6 +282,22 @@ server after `neocore connect`. Hermes gets the same memory tools. Groups, and a
 messages your agent, keep a separate memory per chat and never see yours. Settings, what is
 stored and the one-time downloads are described in [integrations/hermes](integrations/hermes/README.md).
 
+## Quick start: Gemini CLI, Cursor, Copilot CLI, opencode
+
+`neocore setup` also sets up each of these it finds on the machine (`--tools gemini-cli,cursor`
+to pick, `--tools none` to skip). Each gets what its own hooks allow:
+
+| Tool | Memory tools (MCP) | Recall with every prompt | Turns kept in the memory |
+|---|---|---|---|
+| Gemini CLI | yes | yes (`BeforeAgent` hook) | yes (`AfterAgent` hook) |
+| Cursor | yes | no: its prompt hook cannot add text, so the agent searches | yes |
+| GitHub Copilot CLI | yes | no: its prompt hook cannot add text | not yet |
+| opencode | yes | not yet | not yet |
+
+Setup merges into each tool's own settings file and keeps a `.neocore-backup` copy;
+`neocore uninstall` removes only NeoCore's entries. Gemini CLI runs MCP servers only in folders
+you trust. For any other tool that speaks MCP, `neocore mcp-config` prints the entry to paste.
+
 ## Quick start: any assistant
 
 ```python
@@ -386,6 +405,10 @@ NeoCore 0.3 is beta.
   round). Opt-in sharing is how it learns everyone's.
 - **Windows, macOS and Linux.** The daemon and hooks are developed on Windows and use only the
   standard library elsewhere. Please report issues.
+- **Gemini CLI, Cursor, Copilot CLI and opencode are new (0.3.6).** Gemini CLI, Copilot CLI and
+  opencode were each checked to load NeoCore's memory tools from what setup writes; Cursor's
+  setup follows its documentation. The hooks are tested with the inputs each tool documents.
+  Long daily use so far is on Claude Code, Codex and Hermes.
 
 ## License
 
