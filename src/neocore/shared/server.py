@@ -393,7 +393,8 @@ class MemoryService:
                 "instructions": (
                     "The user's shared memory across all their AIs and machines. Search it "
                     "when earlier work, decisions or preferences may matter; open a hit for the "
-                    "whole turn; remember only what the user asks you to keep."),
+                    "whole turn; remember only what the user asks you to keep; report a "
+                    "correction with neocore_feedback."),
             }
         elif method == "ping":
             result = {}

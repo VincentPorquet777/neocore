@@ -323,7 +323,7 @@ def test_mcp_offers_every_memory_tool_without_a_server(
     assert [r["id"] for r in replies] == [1, 2, 3, 4, 5]
     names = [t["name"] for t in replies[1]["result"]["tools"]]
     assert names == ["neocore_profile", "neocore_search", "neocore_open", "neocore_timeline",
-                     "neocore_facts", "neocore_remember"]
+                     "neocore_facts", "neocore_feedback", "neocore_remember"]
     texts = [r["result"]["content"][0]["text"] for r in replies[2:]]
     if daemon:  # the 0.2 tool name still works: a search
         assert texts == ["daemon:neocore_search", "daemon:neocore_profile",

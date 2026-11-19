@@ -902,16 +902,21 @@ class DevMemory:
 
         profile_id = dev_render.PROFILE_ID + dev_profile.scope_key(allowed)
         def read_briefing() -> str:
+            from neocore.assistant import prefs as dev_prefs
+
             allowance = RecallDeadline(deadline.end, 0.0) if finalizing and deadline else deadline
             text = _bounded_stage(
                 lambda: dev_profile.get(
                     self.home, allowed, rows=self.store.rows,
-                    fact_support=self.recall_engine.fact_support),
+                    fact_support=self.recall_engine.fact_support)
+                if self.config.get("profile", True) else "",
                 allowance)
-            return normalize(text)
+            # Rules learnt from repeated corrections ride with the briefing (no model call).
+            learnt = dev_prefs.block(self.home, allowed)
+            return normalize("\n\n".join(part for part in (text, learnt) if part))
 
         briefing = ""
-        if last is None and self.config.get("profile", True) and profile_id not in held:
+        if last is None and profile_id not in held:
             briefing = read_briefing()
         # Scoring stops early enough to finish: given the whole remainder, a slow scorer used it
         # all and the recall then failed its own deadline, delivering nothing.
@@ -1143,6 +1148,11 @@ class DevMemory:
         renew = keep or (lambda: None)
         receipt: dict[str, Any] = {"index": self.recall_engine.backfill(2048)}
         renew()
+        if (self.home / "preferences.json").exists():
+            from neocore.assistant import prefs as dev_prefs
+
+            # Learnt rules nobody used expire on dates alone; no model call.
+            dev_prefs.settle(self.home)
         if self.gate.mode == "filter":
             from neocore.assistant import filter as dev_relevance
             from neocore.assistant import outcomes as dev_outcomes
@@ -1996,6 +2006,17 @@ def _tool_daemon(name: str, arguments: Any) -> dict[str, Any] | None:
         time.sleep(0.25)  # a local file check while the daemon warms up; no model is called
 
 
+# Each chat starts its own ``neocore mcp``: this process's id tells one conversation's
+# corrections from another's (``neocore_feedback`` learns a rule from two conversations).
+MCP_CONVERSATION = uuid.uuid4().hex[:16]
+
+
+def _with_conversation(name: str, arguments: Any) -> Any:
+    if name != "neocore_feedback" or not isinstance(arguments, dict):
+        return arguments
+    return {**arguments, "_conversation": f"mcp-{MCP_CONVERSATION}"}
+
+
 def mcp_server() -> None:
     """stdio MCP server with the memory tools (``neocore.shared.tools``): with ``remote.json``
     each call goes to the memory server, under this device's key and scopes; otherwise to the
@@ -2028,6 +2049,7 @@ def mcp_server() -> None:
     def call(name: str, arguments: Any) -> tuple[str, bool]:
         if name == "neocore_recall":  # the single tool of 0.2: a search by another name
             name = "neocore_search"
+        arguments = _with_conversation(name, arguments)
         try:
             answer = _tool_daemon(name, arguments)
             if answer is not None:
@@ -2100,6 +2122,9 @@ def _remote_mcp(remote: Any) -> None:
         elif method == "ping":
             reply = {"jsonrpc": "2.0", "id": ident, "result": {}}
         elif method == "tools/call":
+            arguments = _with_conversation(str(params.get("name")), params.get("arguments"))
+            if arguments is not params.get("arguments"):
+                request = {**request, "params": {**params, "arguments": arguments}}
             reply = client.mcp(remote, HOME, request)
         else:
             reply = {"jsonrpc": "2.0", "id": ident,

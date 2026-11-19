@@ -324,12 +324,43 @@ class Tools:
         """The user's briefing for exactly the caller's scopes (``neocore.assistant.profile``)."""
         from neocore.assistant import profile as dev_profile
 
+        from neocore.assistant import prefs as dev_prefs
+
         text = dev_profile.get(
             self.memory.home, scopes, rows=self._rows,
             fact_support=self.memory.recall_engine.fact_support,
         )
-        return (dev_render.PROFILE_HEAD + text if text
-                else "No briefing yet: the next sync writes it from the memory's facts.")
+        learnt = dev_prefs.block(self.memory.home, scopes)
+        if not text:
+            text = "No briefing yet: the next sync writes it from the memory's facts."
+            return text + ("\n\n" + learnt if learnt else "")
+        return dev_render.PROFILE_HEAD + text + ("\n\n" + learnt if learnt else "")
+
+    def feedback(self, args: dict[str, Any], *, write_scope: str, device: str) -> str:
+        """A correction or a learnt rule's use (``neocore.assistant.prefs``): counted, no model."""
+        from neocore.assistant import prefs as dev_prefs
+
+        event = _text(args.get("event"), "event", size=20) or "correction"
+        topic = _text(args.get("topic"), "topic", required=True, size=120)
+        rule = redact(_text(args.get("rule"), "rule", size=500))
+        quote = redact(_text(args.get("quote"), "quote", size=500))
+        # No chat id (a direct server call): one conversation per device and day, never one
+        # per call, so a single chat cannot make a rule on its own.
+        conversation = (_text(args.get("_conversation"), "_conversation", size=120)
+                        or f"{datetime.now(timezone.utc):%Y-%m-%d}")
+        try:
+            with self.write_lock:
+                pref = dev_prefs.record(
+                    self.writer.home, event, topic, rule=rule, quote=quote, scope=write_scope,
+                    conversation=f"{device}:{conversation}", by=device)
+        except ValueError as error:
+            raise ToolError(str(error)) from None
+        if pref.get("status") == "noted":
+            return (f"Noted. It becomes a rule once {pref['needed']} conversations make this "
+                    f"correction (so far {pref['conversations']}).")
+        state = pref["status"] + (" (pinned)" if pref.get("pinned") else "")
+        broken = f", broken {pref['broken']}x since learnt" if pref.get("broken") else ""
+        return f"Rule {pref['id']} is {state}{broken}: {pref.get('rule', '')}"
 
     def remember(self, args: dict[str, Any], *, write_scope: str, device: str) -> str:
         """Store a note the user asked to keep: a turn (the record) plus a fact citing it, found
@@ -364,6 +395,8 @@ class Tools:
             raise ToolError("arguments must be an object")
         if name == "neocore_remember":
             return self.remember(args, write_scope=write_scope, device=device)
+        if name == "neocore_feedback":
+            return self.feedback(args, write_scope=write_scope, device=device)
         reads = {"neocore_profile": self.profile, "neocore_search": self.search,
                  "neocore_open": self.open, "neocore_timeline": self.timeline,
                  "neocore_facts": self.facts}
@@ -431,6 +464,29 @@ TOOLS: list[dict[str, Any]] = [
             "optionally matching a query, a project or a date range."),
         "inputSchema": {"type": "object",
                         "properties": {"query": {"type": "string"}, **_FILTERS}},
+    },
+    {
+        "name": "neocore_feedback",
+        "description": (
+            "Report when the user corrects you or tells you how they want something done, so a "
+            "correction they keep making becomes a rule every AI sharing this memory follows. "
+            "event=correction (the default): topic is a short name for what it is about (reuse "
+            "the topic of a learnt rule when it is the same thing), rule is what to do from now "
+            "on, quote is the user's own words. event=reversed: the user now wants the opposite "
+            "of a learnt rule. event=applied: you followed a learnt rule where it mattered. "
+            "event=outdated: a learnt rule no longer holds. A correction becomes a rule once "
+            "two conversations make it. Never include secrets."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event": {"type": "string",
+                          "enum": ["correction", "reversed", "applied", "outdated"]},
+                "topic": {"type": "string"},
+                "rule": {"type": "string", "description": "what to do from now on"},
+                "quote": {"type": "string", "description": "the user's words"},
+            },
+            "required": ["topic"],
+        },
     },
     {
         "name": "neocore_remember",

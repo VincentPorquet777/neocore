@@ -181,6 +181,33 @@ Only records `build` stamped ever fire. A rule can quote you from a transcript
 (`--words "..." --source FILE --line N`, or `owner_source` in the file); the build refuses it
 unless your words are on that line word for word. Every firing is logged locally in `~/.neocore/rules/log.jsonl`.
 
+### Learnt rules: the corrections you keep making
+
+You should not have to write every rule yourself. When you correct an AI ("write names in full,
+no abbreviations"), it reports the correction with the `neocore_feedback` memory tool, in the
+same turn and with no extra model call. Everything after that is counting and dates:
+
+- **Learnt** once two different conversations make the same correction. From then on the rule
+  rides with the briefing at the start of every chat, on every AI sharing the memory.
+- **Confirmed** when an AI reports it applied, or you correct it again in another conversation.
+  That second correction is also counted as "broken 1x", and the briefing lists the most broken
+  rules first, because a rule that keeps being broken needs the most attention.
+- **Retired** when nothing touches it (45 days while learning, 180 once confirmed), when you say
+  the opposite in two conversations, when it is reported out of date, or when you reject it.
+  `neocore prefs pin ID` keeps a rule from expiring.
+
+```bash
+neocore prefs list          # rules in force (--all: retired ones, and corrections still counting)
+neocore prefs add "client emails" "Use British spelling in client emails."
+neocore prefs pin pref-1a2b3c4d5e
+neocore prefs reject pref-1a2b3c4d5e
+neocore prefs log           # every change, oldest first
+```
+
+Learnt rules live in `~/.neocore/preferences.json`, with every change in
+`preferences.log.jsonl`. On a shared memory server each rule stays in the memory its
+corrections came from.
+
 ## NeoSift: the local relevance filter
 
 Recall finds candidates by words and meaning, but many of them only share words with the

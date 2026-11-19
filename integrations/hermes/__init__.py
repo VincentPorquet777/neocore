@@ -65,7 +65,8 @@ SHARED_NOTE = (
     "in a memory block, each saying which AI and project it came from. To look further, call "
     "neocore_search; neocore_open reads one item in full, neocore_timeline shows what they "
     "worked on when, neocore_facts lists current facts. Call neocore_remember only when the "
-    "person asks you to remember something."
+    "person asks you to remember something, and neocore_feedback when they correct how you "
+    "did something."
 )
 # Recalled context Hermes fenced into a message is not something the person said: never store it.
 _FENCED = re.compile(r"<memory-context>.*?</memory-context>", re.S | re.I)
@@ -764,8 +765,11 @@ class NeoCoreMemoryProvider(MemoryProvider):
         """The shared memory's own tools (the ones Claude Code and Codex get), as plain text."""
         shared = self._shared
         assert shared is not None
-        if name == "neocore_remember" and not self._writes:
+        if name in ("neocore_remember", "neocore_feedback") and not self._writes:
             return "Not stored: this run only reads memory."
+        if name == "neocore_feedback" and isinstance(args, dict):
+            # One Hermes session is one conversation: a rule needs two of them.
+            args = {**args, "_conversation": f"hermes-{self._session_id}"}
         try:
             if shared.local:
                 from neocore.assistant.memory import SCOPE

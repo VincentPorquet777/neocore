@@ -10,6 +10,7 @@
     neocore doctor
     neocore recall "QUERY" | status | stats | sync ...  (memory commands: ``neocore memory -h``)
     neocore forget CONVERSATION
+    neocore prefs list [--all] | add TOPIC RULE | pin|unpin|reject ID | log   (learnt rules)
     neocore connect --url URL --key-file FILE [--ssh HOST --socket PATH] [--tools-only]
     neocore disconnect
     neocore server init | serve | keys | scopes | audit | export | forget  (shared memory)
@@ -34,6 +35,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -408,6 +410,56 @@ def _other_tools(chosen: str | None) -> list[str]:
     return names
 
 
+def prefs_command(argv: list[str]) -> None:
+    """``neocore prefs``: rules learnt from repeated corrections (``neocore.assistant.prefs``)."""
+    from neocore.assistant import prefs
+
+    parser = argparse.ArgumentParser(prog="neocore prefs")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("list").add_argument("--all", action="store_true",
+                                        help="also retired rules and corrections still counting")
+    one = sub.add_parser("add", help="report a correction yourself (one conversation's worth)")
+    one.add_argument("topic")
+    one.add_argument("rule")
+    for name in ("pin", "unpin", "reject"):
+        sub.add_parser(name).add_argument("id")
+    sub.add_parser("log", help="every change, oldest first")
+    args = parser.parse_args(argv)
+    home = memory.HOME
+    if args.action == "list":
+        data = prefs.settle(home) if (home / prefs.FILE).exists() else prefs.load(home)
+        rows = [p for p in data["prefs"].values() if args.all or p["status"] in prefs.ACTIVE]
+        for pref in sorted(rows, key=lambda p: (p["status"] not in prefs.ACTIVE, p["id"])):
+            flags = ("pinned, " if pref.get("pinned") else "") + pref["status"]
+            broken = f", broken {pref['broken']}x" if pref.get("broken") else ""
+            print(f"{pref['id']}  [{flags}{broken}]  {pref.get('topic', '')}: {pref.get('rule', '')}")
+        if args.all:
+            counting: dict[str, set[str]] = {}
+            for signal in data["signals"]:
+                if signal["event"] == "correction" and all(
+                        p["key"] != signal["key"] for p in data["prefs"].values()):
+                    counting.setdefault(signal["topic"], set()).add(signal["conversation"])
+            for topic, seen in sorted(counting.items()):
+                print(f"(counting, {len(seen)} of {prefs.THRESHOLD})  {topic}")
+        if not rows:
+            print("No learnt rules yet. A correction becomes a rule once two conversations "
+                  "make it (the AI reports them with neocore_feedback).")
+    elif args.action == "add":
+        print(json.dumps(prefs.record(home, "correction", args.topic, rule=args.rule,
+                                      conversation=f"cli-{os.getpid()}-{int(time.time())}",
+                                      by="cli"), indent=1))
+    elif args.action == "log":
+        path = home / prefs.LOG
+        print(path.read_text(encoding="utf-8") if path.exists() else "", end="")
+    else:
+        try:
+            pref = prefs.set_flag(home, args.id, reject=args.action == "reject",
+                                  pinned={"pin": True, "unpin": False}.get(args.action))
+        except KeyError:
+            sys.exit(f"no learnt rule {args.id} (`neocore prefs list --all`)")
+        print(json.dumps(pref, indent=1))
+
+
 def _ask_share() -> bool:
     """Asked once, at setup; anything but yes (or no terminal to ask in) leaves it off."""
     if not sys.stdin.isatty():
@@ -521,6 +573,9 @@ def main(argv: list[str] | None = None) -> None:
         from neocore.assistant import hosts
 
         hosts.main(argv[1:])
+        return
+    if argv[:1] == ["prefs"]:
+        prefs_command(argv[1:] or ["list"])
         return
     if argv[:1] == ["mcp-config"]:
         print(json.dumps(tools.mcp_config(), indent=2))
