@@ -1,6 +1,7 @@
 """A long-running reader observes new and changed vectors written by another connection."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -43,3 +44,42 @@ def test_replacement_after_withdrawal_and_in_place_maintenance(tmp_path: Path) -
     assert vectors[ids.index(sid)].tolist() == [0.5, 0.5]
     writer.close()
     store.close()
+
+
+def test_epoch_and_cold_rows_share_one_snapshot_across_writer_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    np = pytest.importorskip("numpy")
+    db = Store(tmp_path / "overlap.db")
+    writer = Store(tmp_path / "overlap.db")
+    memory = db
+    index = GovernedRecall(
+        writer, embedder=lambda inputs: [[1, 0]] * len(inputs), embedding_model="axes"
+    )
+    assert writer.capture("Amber coating.", role="user", thread_id="first")
+    index.backfill()
+    engine = GovernedRecall(memory, embedding_model="axes")
+    key = str(
+        writer.rows("SELECT span_id FROM recall_vectors ORDER BY rowid LIMIT 1")[0]["span_id"]
+    )
+    original = db.rows
+    writes = []
+
+    def interleave(sql: str, parameters: tuple[Any, ...] = ()) -> Any:
+        rows = original(sql, parameters)
+        if " AS epoch" in sql and not writes:
+            with writer.connection() as conn:
+                conn.execute(
+                    "UPDATE recall_vectors SET vector=? WHERE span_id=?",
+                    (np.array([0, 1], dtype=np.float32).tobytes(), key),
+                )
+            writes.append(key)
+        return rows
+
+    monkeypatch.setattr(db, "rows", interleave)
+    ids, cold = engine._span_vectors.load(memory, "axes")
+    assert writes == [key] and cold[ids.index(key)].tolist() == [1, 0]
+    ids, updated = engine._span_vectors.load(memory, "axes")
+    assert updated[ids.index(key)].tolist() == [0, 1]
+    writer.close()
+    db.close()

@@ -224,29 +224,25 @@ class _VectorCache:
     def load(self, store: Any, model: str) -> tuple[list[str], Any]:
         import numpy as np
 
-        # The epoch and vectors belong to the same SQLite statement snapshot. A writer
-        # may append while this request runs; the next read will pick up its rows.
-        epoch = self.generation[1] if self.generation and self.generation[0] == model else -1
-        try:
+        # Keep the epoch and vector rows in one read snapshot. The ordered range scan can
+        # stream by rowid without materializing a temporary sort of every vector on cold start.
+        with store.read_snapshot():
+            try:
+                version = store.rows(
+                    "SELECT coalesce((SELECT epoch FROM recall_vector_epochs WHERE name=?),0) "
+                    "AS epoch", (self.table,),
+                )
+                generation = (model, int(version[0]["epoch"]))
+            except sqlite3.OperationalError as error:
+                if str(error) != "no such table: recall_vector_epochs":
+                    raise
+                # Read-only historical snapshots may predate the tracking table.
+                generation = None
+            same_generation = generation is not None and generation == self.generation
+            after = self.last_rowid if same_generation else 0
             rows = store.rows(
-                f"SELECT e.epoch,v.rowid,v.{self.key},v.vector FROM (SELECT coalesce("
-                "(SELECT epoch FROM recall_vector_epochs WHERE name=?),0) AS epoch) e "
-                f"LEFT JOIN {self.table} v ON v.model=? AND v.rowid > "
-                "CASE WHEN e.epoch=? THEN ? ELSE 0 END ORDER BY v.rowid",
-                (self.table, model, epoch, self.last_rowid),
-            )
-            generation = (model, int(rows[0]["epoch"]))
-            if rows[0]["rowid"] is None:
-                rows = []
-        except sqlite3.OperationalError as error:
-            # An older snapshot can be mounted strictly read-only. Rebuild from it
-            # rather than relying on a write-generation marker it never recorded.
-            if str(error) != "no such table: recall_vector_epochs":
-                raise
-            generation = None
-            rows = store.rows(
-                f"SELECT rowid,{self.key},vector FROM {self.table} WHERE model=? ORDER BY rowid",
-                (model,),
+                f"SELECT rowid,{self.key},vector FROM {self.table} "
+                "WHERE model=? AND rowid>? ORDER BY rowid", (model, after),
             )
         if generation is None or generation != self.generation:
             self.ids = []
