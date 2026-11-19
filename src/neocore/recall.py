@@ -344,6 +344,8 @@ class GovernedRecall:
                 "AND coalesce((SELECT d.state FROM evidence_access d "
                 "WHERE d.evidence_id=e.evidence_id "
                 "ORDER BY d.created_at DESC,d.disposition_id DESC LIMIT 1),'active')='active'"
+                # An index on turn identity must not reorder the bounded embedding backlog.
+                " ORDER BY e.rowid"
             ).fetchall()
             for row in rows:
                 evidence_id = str(row["evidence_id"])
@@ -408,7 +410,7 @@ class GovernedRecall:
             counts["vectors_added"] = self._embed_missing(
                 "SELECT s.span_id AS id,s.anchored_text AS text FROM recall_spans s "
                 "LEFT JOIN recall_vectors v ON v.span_id=s.span_id AND v.model=? "
-                "WHERE v.span_id IS NULL LIMIT ?",
+                "WHERE v.span_id IS NULL ORDER BY s.rowid LIMIT ?",
                 "INSERT OR REPLACE INTO recall_vectors(span_id,model,vector) VALUES(?,?,?)",
                 limit,
             )
@@ -417,7 +419,7 @@ class GovernedRecall:
             counts["fact_vectors_added"] = self._embed_missing(
                 "SELECT f.fact_id AS id,f.text AS text FROM recall_facts f "
                 "LEFT JOIN recall_fact_vectors v ON v.fact_id=f.fact_id AND v.model=? "
-                "WHERE v.fact_id IS NULL LIMIT ?",
+                "WHERE v.fact_id IS NULL ORDER BY f.rowid LIMIT ?",
                 "INSERT OR REPLACE INTO recall_fact_vectors(fact_id,model,vector) VALUES(?,?,?)",
                 limit,
             )

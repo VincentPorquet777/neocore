@@ -83,3 +83,16 @@ def test_epoch_and_cold_rows_share_one_snapshot_across_writer_commit(
     assert updated[ids.index(key)].tolist() == [0, 1]
     writer.close()
     db.close()
+
+
+def test_fresh_index_spends_its_embedding_budget_in_capture_order(tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+    store = Store(tmp_path / "ordering.db")
+    evidence = [store.capture(word, role="user", thread_id=word) for word in ("zulu", "alpha")]
+    recall = GovernedRecall(store, embedder=lambda items: [[1, 0]] * len(items), embedding_model="test")
+    recall.backfill(limit=1)
+    embedded = store.rows(
+        "SELECT s.evidence_id FROM recall_vectors v JOIN recall_spans s ON s.span_id=v.span_id"
+    )
+    assert [row["evidence_id"] for row in embedded] == evidence[:1]
+    store.close()
