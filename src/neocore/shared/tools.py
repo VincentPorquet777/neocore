@@ -384,6 +384,11 @@ class Tools:
             fact = self.writer.recall_engine.add_fact(
                 f"On {today.day} {today:%B %Y}, the user asked to remember: {redact(text)}",
                 [str(row[0]["evidence_id"])], former=f"remember:{device}"[:60])
+        if fact:
+            from neocore.assistant import changes
+
+            changes.log(self.writer.home, {"what": "remember", "by": device, "fact": fact,
+                                           "scope": write_scope})
         stored = f" as {fact}" if fact else ""
         return f"Remembered{stored}. Every AI sharing this memory will find it."
 

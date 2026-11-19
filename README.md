@@ -208,6 +208,23 @@ Learnt rules live in `~/.neocore/preferences.json`, with every change in
 `preferences.log.jsonl`. On a shared memory server each rule stays in the memory its
 corrections came from.
 
+## Change log and undo
+
+Every change to what the memory knows is listed in `~/.neocore/changes.jsonl`: each background
+pass that formed facts, slept, wrote lessons or refreshed the briefing (with the facts it added
+and the files it changed), each note an AI was asked to remember, each `forget`, and each undo.
+
+```bash
+neocore changes           # newest last, learnt-rule changes included
+neocore undo --list       # passes that can be taken back
+neocore undo RUN          # delete the facts that pass added and restore the files it changed
+```
+
+Undo never touches what you said (the turns themselves); `neocore forget` deletes those for good,
+and it deletes every undo copy with them, since a copy may hold text derived from what is being
+forgotten. Passes are undone newest first when they changed the same files. The copies cost no
+disk space until a file changes (hard links), and the last 30 passes are kept.
+
 ## NeoSift: the local relevance filter
 
 Recall finds candidates by words and meaning, but many of them only share words with the

@@ -287,6 +287,12 @@ class Store:
                     (revision_family_key(family), "" if revision is None else str(revision)),
                 )
             db.execute("DELETE FROM evidence WHERE evidence_id=?", (evidence_id,))
+        if self.path != ":memory:":
+            # Undo copies (``neocore.assistant.changes``) may hold text derived from what is
+            # being forgotten: they go too.
+            import shutil
+
+            shutil.rmtree(Path(self.path).parent / "undo", ignore_errors=True)
 
     def state(self, evidence_id: str) -> str:
         found = self.rows(

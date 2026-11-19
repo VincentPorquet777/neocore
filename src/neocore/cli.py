@@ -11,6 +11,8 @@
     neocore recall "QUERY" | status | stats | sync ...  (memory commands: ``neocore memory -h``)
     neocore forget CONVERSATION
     neocore prefs list [--all] | add TOPIC RULE | pin|unpin|reject ID | log   (learnt rules)
+    neocore changes [--limit N]     what changed the memory, newest last
+    neocore undo [RUN | --list]     take one background pass back (``neocore changes``)
     neocore connect --url URL --key-file FILE [--ssh HOST --socket PATH] [--tools-only]
     neocore disconnect
     neocore server init | serve | keys | scopes | audit | export | forget  (shared memory)
@@ -539,7 +541,46 @@ def forget(args: argparse.Namespace) -> None:
     for row in rows:
         store.forget(str(row["evidence_id"]), reason=args.reason or "forgotten by the user")
     memory.DevMemory().recall_engine.refresh()
+    from neocore.assistant import changes
+
+    changes.log(memory.HOME, {"what": "forget", "by": "cli", "messages": len(rows),
+                              "conversation": args.conversation,
+                              "note": "undo copies deleted with it"})
     print(f"forgot {len(rows)} messages of {args.conversation}")
+
+
+def changes_command(argv: list[str]) -> None:
+    from neocore.assistant import changes
+
+    parser = argparse.ArgumentParser(prog="neocore changes")
+    parser.add_argument("--limit", type=int, default=30)
+    args = parser.parse_args(argv)
+    for row in changes.entries(memory.HOME)[-args.limit:]:
+        rest = {k: v for k, v in row.items() if k not in ("at", "what")}
+        print(f"{row.get('at', '')}  {row.get('what', '')}  {json.dumps(rest, ensure_ascii=False)}")
+
+
+def undo_command(argv: list[str]) -> None:
+    from neocore.assistant import changes
+
+    parser = argparse.ArgumentParser(prog="neocore undo")
+    parser.add_argument("run", nargs="?", help="a run id from `neocore undo --list`")
+    parser.add_argument("--list", action="store_true", help="runs that can be undone")
+    args = parser.parse_args(argv)
+    if args.list or not args.run:
+        found = changes.runs(memory.HOME)
+        for run in found:
+            print(f"{run['run']}  {len(run['facts'])} facts added, files: "
+                  f"{', '.join(run['files']) or 'none'}")
+        if not found:
+            print("Nothing to undo.")
+        return
+    try:
+        print(json.dumps(changes.undo(memory.DevMemory(), args.run), indent=1))
+    except KeyError:
+        sys.exit(f"no run {args.run} to undo (`neocore undo --list`)")
+    except ValueError as error:
+        sys.exit(str(error))
 
 
 def _set_up_by_hand(command: str) -> bool:
@@ -573,6 +614,12 @@ def main(argv: list[str] | None = None) -> None:
         from neocore.assistant import hosts
 
         hosts.main(argv[1:])
+        return
+    if argv[:1] == ["changes"]:
+        changes_command(argv[1:])
+        return
+    if argv[:1] == ["undo"]:
+        undo_command(argv[1:])
         return
     if argv[:1] == ["prefs"]:
         prefs_command(argv[1:] or ["list"])

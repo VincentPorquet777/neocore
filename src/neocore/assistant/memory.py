@@ -1144,7 +1144,15 @@ class DevMemory:
                  profile_scopes: list[frozenset[str]] | None = None) -> dict[str, Any]:
         """Index, judge outcomes, form facts, sleep, refresh the user's briefings (one per scope
         set in ``profile_scopes``; default: the local scope). ``keep`` is called between these
-        steps and before each model call (``sync`` renews its lock with it)."""
+        steps and before each model call (``sync`` renews its lock with it). A pass that changes
+        what the memory knows is listed in ``changes.jsonl`` and can be undone (``changes``)."""
+        from neocore.assistant import changes
+
+        with changes.run(self, "background pass", by="sync"):
+            return self._maintain(keep, profile_scopes=profile_scopes)
+
+    def _maintain(self, keep: Callable[[], None] | None = None, *,
+                  profile_scopes: list[frozenset[str]] | None = None) -> dict[str, Any]:
         renew = keep or (lambda: None)
         receipt: dict[str, Any] = {"index": self.recall_engine.backfill(2048)}
         renew()

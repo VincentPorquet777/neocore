@@ -453,6 +453,24 @@ class GovernedRecall:
             connection.execute("DELETE FROM recall_facts WHERE fact_id=?", (fact_id,))
         return len(stale)
 
+    def delete_facts(self, fact_ids: Sequence[str]) -> int:
+        """Delete these formed facts (``neocore undo``); the turns they cite stay."""
+        deleted = 0
+        with self.store.connection() as connection:
+            for fact_id in fact_ids:
+                row = connection.execute(
+                    "SELECT rowid,text FROM recall_facts WHERE fact_id=?", (fact_id,)).fetchone()
+                if row is None:
+                    continue
+                connection.execute(
+                    "INSERT INTO recall_facts_fts(recall_facts_fts,rowid,text) "
+                    "VALUES('delete',?,?)", (row[0], row[1]))
+                connection.execute("DELETE FROM recall_fact_vectors WHERE fact_id=?", (fact_id,))
+                connection.execute("DELETE FROM recall_fact_sources WHERE fact_id=?", (fact_id,))
+                connection.execute("DELETE FROM recall_facts WHERE fact_id=?", (fact_id,))
+                deleted += 1
+        return deleted
+
     def _embed_missing(self, select: str, insert: str, limit: int | None, batch: int = 64) -> int:
         from array import array
 
