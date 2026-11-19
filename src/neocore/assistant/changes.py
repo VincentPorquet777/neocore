@@ -30,7 +30,8 @@ from typing import Any
 
 LOG = "changes.jsonl"
 UNDO = "undo"  # Store.forget deletes this folder (see neocore.store)
-STATE_FILES = ("sleep.json", "profile.json", "lessons.json", "preferences.json")
+STATE_FILES = ("sleep.json", "profile.json", "lessons.json", "preferences.json",
+               "validity.json")
 KEEP_RUNS = 30
 
 

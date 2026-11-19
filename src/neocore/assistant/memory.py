@@ -653,6 +653,7 @@ class DevMemory:
             raise PermissionError("recall requires at least one allowed scope")
         from neocore.assistant import render as dev_render
         from neocore.assistant import sleep as dev_sleep
+        from neocore.assistant import validity as dev_validity
         from neocore.assistant.filter import HOP, SOLO_EXTRA
 
         timing = dict(timing or {})
@@ -820,9 +821,12 @@ class DevMemory:
                               + dev_render.unreadable_source(marks, "recall_facts.fact_id"),
                               (*wanted, *sorted(allowed)))
             } if wanted else {}
+            dates = dev_validity.load(self.home) if facts else {}
             for fact_id, fact in facts.items():
                 if fact_id in replaced and fact_id not in duplicates:
                     fact["newer"] = [replaced[fact_id]]
+                elif fact_id in dates:
+                    fact["valid"] = dates[fact_id]
             items = [facts[f] for f in fact_ids if f in facts]
             listed = {i["id"] for i in items}
             for evidence_id, spans in excerpts.items():

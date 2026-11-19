@@ -17,6 +17,7 @@
     neocore undo [RUN | --list]     take one background pass back (``neocore changes``)
     neocore hygiene [--apply]       duplicates, clashing numbers, overlapping rules (no model)
     neocore correct ID [--to TEXT] [--apply]   what rests on a fact or message, then fix it
+    neocore valid FACT [--from DATE] [--until DATE] [--clear]   when a fact holds
     neocore connect --url URL --key-file FILE [--ssh HOST --socket PATH] [--tools-only]
     neocore disconnect
     neocore server init | serve | keys | scopes | audit | export | forget  (shared memory)
@@ -676,6 +677,31 @@ def correct_command(argv: list[str]) -> None:
               + " to correct it; `neocore undo` takes it back.")
 
 
+def valid_command(argv: list[str]) -> None:
+    """``neocore valid FACT [--from DATE] [--until DATE] [--clear]``: when a fact holds."""
+    from neocore.assistant import changes, validity
+
+    parser = argparse.ArgumentParser(prog="neocore valid")
+    parser.add_argument("fact", help="a fact id (fact_...)")
+    parser.add_argument("--from", dest="start", help="YYYY-MM-DD it starts to hold")
+    parser.add_argument("--until", help="YYYY-MM-DD, the last day it holds")
+    parser.add_argument("--clear", action="store_true", help="remove the dates set for it")
+    args = parser.parse_args(argv)
+    dev = memory.DevMemory()
+    row = dev.store.rows("SELECT occurred_at FROM recall_facts WHERE fact_id=?", (args.fact,))
+    if not row:
+        sys.exit(f"no fact {args.fact} in this memory")
+    if args.start or args.until or args.clear:
+        try:
+            with changes.run(dev, "validity: " + args.fact, by="cli"):
+                validity.set_range(dev.home, args.fact, start=args.start, until=args.until,
+                                   clear=args.clear)
+        except ValueError as error:
+            sys.exit(str(error))
+    span = validity.ranges(dev.home, dev.store.rows, {args.fact: str(row[0]["occurred_at"])})
+    print(json.dumps(span[args.fact], indent=1))
+
+
 def _set_up_by_hand(command: str) -> bool:
     """Whether ``neocore setup`` already put this hook in the host's own settings: the Claude
     Code and Codex plugins then stay quiet, so a machine set up both ways recalls once."""
@@ -722,6 +748,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if argv[:1] == ["correct"]:
         correct_command(argv[1:])
+        return
+    if argv[:1] == ["valid"]:
+        valid_command(argv[1:])
         return
     if argv[:1] == ["prefs"]:
         prefs_command(argv[1:] or ["list"])

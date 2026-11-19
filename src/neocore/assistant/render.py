@@ -18,6 +18,7 @@ from functools import cache
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from neocore.assistant.validity import label as _validity_label
 from neocore.recall import _SPEAKER_PREFIX, _WORD, _parse_time
 
 # -- repairing and comparing text ---------------------------------------------------------------
@@ -284,7 +285,7 @@ def render(items: list[dict[str, Any]], origin: dict[str, tuple[str, str]], budg
             text = text[:1].upper() + text[1:]
             if copied(text, []):
                 continue
-            mark = " (replaced)" if item.get("newer") else ""
+            mark = " (replaced)" if item.get("newer") else _validity_label(item.get("valid"))
             line = (f"- {_short_day(item['occurred_at'])}{_label(origin.get(item['id']))}{mark}: "
                     f"{text}\n")
             if used + len(line.encode()) <= budget:

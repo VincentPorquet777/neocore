@@ -253,6 +253,26 @@ the value check would have caught 6; lowering its threshold to catch 33 mostly f
 projects that happen to carry different version numbers. So it is a free safety net, strict on
 purpose, for memories without sleep; it does not replace sleep.
 
+## When a fact holds
+
+Every fact has a range: from the day it happened until the day a newer fact replaced it, or
+until a date set for it. Your AIs can see it and ask about it:
+
+- `neocore_facts` with `as_of: "2026-11-05"` lists what held that day, facts replaced since
+  included; without it, facts that were replaced or whose end date has passed are left out.
+- `neocore_open` on a fact says "Holds: from 2026-11-01 to 2026-11-09 (replaced by fact_…)".
+- `neocore_remember` takes `from` and `until` for things that only hold for a time ("the office
+  is closed until 2 January", "the new price applies from 1 December"); recall marks them
+  `(until …)`, `(from …)` or, once past, `(ended …)`.
+
+```bash
+neocore valid FACT_ID --until 2026-12-31   # or --from DATE, or --clear; undoable
+```
+
+Ranges come from what the memory already has, with no model call: on the real memory above,
+sleep's verdicts give about 1,660 facts an end date. Set dates live in `validity.json`, which
+the change log, undo and backup all cover.
+
 ## Read it, keep it: Markdown export and one-file backup
 
 ```bash

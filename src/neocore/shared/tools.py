@@ -20,6 +20,7 @@ from typing import Any
 
 from neocore.assistant import render as dev_render
 from neocore.assistant import sleep as dev_sleep
+from neocore.assistant import validity as dev_validity
 from neocore.assistant.memory import DevMemory, Turn, redact
 
 MAX_LIMIT = 50
@@ -160,6 +161,7 @@ class Tools:
         )
         hidden = dev_sleep.hidden(self.memory.home)
         replaced = dev_sleep.replacements(self.memory.home)
+        dates = dev_validity.load(self.memory.home)
         fact_ids = [f for f in dict.fromkeys(result.fact_ids) if f not in hidden]
         facts = self._readable_facts(fact_ids, scopes)
         excerpts: dict[str, list[Any]] = {}
@@ -183,7 +185,8 @@ class Tools:
             if not self._when_ok(at, since, until) or not self._matches(
                     origin.get(fact_id), project, host):
                 continue
-            note = " (replaced: open it for the newer one)" if fact_id in replaced else ""
+            note = (" (replaced: open it for the newer one)" if fact_id in replaced
+                    else dev_validity.label(dates.get(fact_id)))
             hits.append((fact_id, at, f"fact{note}: {_clip(text, TEXT)}"))
         for evidence_id, spans in excerpts.items():
             at = min(s.occurred_at for s in spans)
@@ -218,6 +221,11 @@ class Tools:
                      f"Sources (open them for the conversation): {', '.join(sources)}"]
             if newer and self._readable_facts([newer], scopes):
                 lines.append(f"Replaced by a newer fact: {newer}")
+            span = dev_validity.ranges(self.memory.home, self._rows,
+                                       {ident: str(row["occurred_at"])})[ident]
+            lines.insert(1, f"Holds: from {span['from']}"
+                         + (f" to {span['last']} ({span['why']})" if span["last"] else
+                            " (still current)"))
             return "\n".join(lines)
         found = self._rows(
             "SELECT thread_id,timestamp,metadata_json FROM evidence WHERE evidence_id=? "
@@ -289,11 +297,14 @@ class Tools:
                                scopes)
         project = _text(args.get("project"), "project", size=200)
         since, until = _date(args.get("since"), "since"), _date(args.get("until"), "until")
+        as_of = _date(args.get("as_of"), "as_of")
         limit = _limit(args.get("limit"), 20)
         hidden = dev_sleep.hidden(self.memory.home)
         replaced = dev_sleep.replacements(self.memory.home)
         where: list[str] = []
         params: list[Any] = []
+        if as_of:  # what held that day: replaced facts count until they were replaced
+            until = min(until, as_of) if until else as_of
         if since:
             where.append("occurred_at>=?")
             params.append(since)
@@ -304,7 +315,18 @@ class Tools:
             "SELECT fact_id FROM recall_facts"  # noqa: S608
             + (" WHERE " + " AND ".join(where) if where else "")
             + " ORDER BY occurred_at DESC LIMIT ?", (*params, limit * 10))]
-        candidates = [f for f in candidates if f not in hidden and f not in replaced]
+        if as_of:
+            spans = dev_validity.ranges(self.memory.home, self._rows, {
+                str(r["fact_id"]): str(r["occurred_at"]) for r in self._rows(
+                    "SELECT fact_id,occurred_at FROM recall_facts WHERE fact_id IN "  # noqa: S608
+                    f"({','.join('?' * len(candidates))})", tuple(candidates))}) \
+                if candidates else {}
+            candidates = [f for f in candidates if f not in hidden and f in spans
+                          and dev_validity.holds_on(spans[f], as_of)]
+        else:
+            candidates = dev_validity.keep(
+                [f for f in candidates if f not in hidden and f not in replaced],
+                self.memory.home)
         facts = self._readable_facts(candidates, scopes)
         current = self.memory.recall_engine.fact_support(list(facts), set(scopes))
         facts = {key: row for key, row in facts.items() if key in current}
@@ -313,11 +335,14 @@ class Tools:
                   if f in facts and self._matches(origin.get(f), project, "")][:limit]
         if not chosen:
             return "No facts in that window."
-        lines = [f"{len(chosen)} current facts, newest first."]
+        lines = [f"{len(chosen)} facts that held on {as_of}, newest first." if as_of else
+                 f"{len(chosen)} current facts, newest first."]
+        dates = dev_validity.load(self.memory.home)
         for f in chosen:
             label = self._label(origin.get(f))
             lines.append(f"- [{f}] {_day(str(facts[f]['occurred_at']))}"
-                         f"{' · ' + label if label else ''} — {facts[f]['text']}")
+                         f"{' · ' + label if label else ''} — {facts[f]['text']}"
+                         f"{dev_validity.label(dates.get(f))}")
         return "\n".join(lines)
 
     def profile(self, args: dict[str, Any], scopes: frozenset[str]) -> str:
@@ -367,6 +392,9 @@ class Tools:
         at once, before background indexing catches up."""
         text = _text(args.get("text"), "text", required=True, size=4000)
         project = _text(args.get("project"), "project", size=200)
+        start, end = _date(args.get("from"), "from"), _date(args.get("until"), "until")
+        if start and end and end < start:
+            raise ToolError("until is before from")
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         session = f"notes-{re.sub(r'[^A-Za-z0-9_-]', '-', device)[:60] or 'device'}"
         turn = Turn("note", session, uuid.uuid4().hex, project, now,
@@ -387,8 +415,12 @@ class Tools:
         if fact:
             from neocore.assistant import changes
 
+            if start or end:
+                dev_validity.set_range(self.writer.home, fact, start=start, until=end, by=device)
             changes.log(self.writer.home, {"what": "remember", "by": device, "fact": fact,
-                                           "scope": write_scope})
+                                           "scope": write_scope,
+                                           **({"from": start} if start else {}),
+                                           **({"until": end} if end else {})})
         stored = f" as {fact}" if fact else ""
         return f"Remembered{stored}. Every AI sharing this memory will find it."
 
@@ -465,10 +497,13 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "neocore_facts",
         "description": (
-            "Current facts about the user's work (superseded ones left out), newest first, "
-            "optionally matching a query, a project or a date range."),
+            "Current facts about the user's work (superseded and ended ones left out), "
+            "newest first, optionally matching a query, a project or a date range. as_of lists "
+            "what held on that day instead, including facts replaced since."),
         "inputSchema": {"type": "object",
-                        "properties": {"query": {"type": "string"}, **_FILTERS}},
+                        "properties": {"query": {"type": "string"}, **_FILTERS,
+                                       "as_of": {"type": "string",
+                                                 "description": "YYYY-MM-DD: what held then"}}},
     },
     {
         "name": "neocore_feedback",
@@ -498,11 +533,16 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Store something the user explicitly asked to remember, so every AI sharing this "
             "memory finds it later. Write it as a complete sentence with names and dates. Do "
-            "not store secrets, passwords or keys."),
+            "not store secrets, passwords or keys. When it only holds for a time (a closure, a "
+            "price from a date, a temporary rule), give from and/or until."),
         "inputSchema": {
             "type": "object",
             "properties": {"text": {"type": "string"},
-                           "project": {"type": "string", "description": "optional folder"}},
+                           "project": {"type": "string", "description": "optional folder"},
+                           "from": {"type": "string",
+                                    "description": "YYYY-MM-DD it starts to hold, if later"},
+                           "until": {"type": "string",
+                                     "description": "YYYY-MM-DD, the last day it holds"}},
             "required": ["text"],
         },
     },

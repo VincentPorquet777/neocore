@@ -34,7 +34,7 @@ from typing import Any
 
 MARKER = ".neocore-export"
 STATE = ("config.json", "offsets.json", "sleep.json", "profile.json", "lessons.json",
-         "preferences.json", "preferences.log.jsonl", "changes.jsonl", "outcomes.jsonl",
+         "preferences.json", "preferences.log.jsonl", "validity.json", "changes.jsonl", "outcomes.jsonl",
          "compactions.json")
 FOLDERS = ("rules", "turns")  # rules check, and turns written by other tools' hooks
 FORMAT = 1
@@ -74,6 +74,7 @@ def markdown(home: Path, out: Path, scope: str = "internal") -> dict[str, int]:
     from neocore.assistant import profile as dev_profile
     from neocore.assistant import render
     from neocore.assistant import sleep as dev_sleep
+    from neocore.assistant import validity
 
     if not (home / "neocore.db").exists():
         raise FileNotFoundError(f"no memory in {home}")
@@ -96,6 +97,7 @@ def markdown(home: Path, out: Path, scope: str = "internal") -> dict[str, int]:
 
     hidden = dev_sleep.hidden(home)
     replaced = dev_sleep.replacements(home)
+    dates = validity.load(home)
     with _read_only(home) as db:
         turns = db.execute(
             "SELECT evidence_id,thread_id,timestamp,speaker,content,metadata_json FROM evidence "
@@ -150,7 +152,9 @@ def markdown(home: Path, out: Path, scope: str = "internal") -> dict[str, int]:
         lines = [f"# Facts, {month}", ""]
         for fact in rows:
             later = replaced.get(str(fact["fact_id"]))
-            note = " *(superseded by a newer fact)*" if later else ""
+            note = " *(superseded by a newer fact)*" if later else \
+                validity.label(dates.get(str(fact["fact_id"]))).replace(" (", " *(").replace(
+                    ")", ")*")
             lines.append(f"- **{_day(str(fact['occurred_at']))}** {fact['text']}{note} "
                          f"{links(str(fact['fact_id']))}".rstrip())
         write(f"Facts/{month}.md", "\n".join(lines))

@@ -62,7 +62,9 @@ def _current_facts(memory: Any, scope: str) -> list[dict[str, Any]]:
     from neocore.assistant import render
     from neocore.assistant import sleep as dev_sleep
 
-    hidden = dev_sleep.hidden(memory.home)
+    from neocore.assistant import validity
+
+    hidden = dev_sleep.hidden(memory.home) | set(validity.ended(memory.home))
     replaced = dev_sleep.replacements(memory.home)
     try:
         verdicts = json.loads((memory.home / "sleep.json").read_text(encoding="utf-8"))["facts"]
