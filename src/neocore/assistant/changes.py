@@ -8,8 +8,9 @@ each undo. Learnt-rule changes have their own log (``preferences.log.jsonl``);
 
 ``neocore undo RUN`` takes one run back: the facts it added are deleted and the state files it
 changed (``sleep.json``, ``profile.json``, ``lessons.json``, ``preferences.json``) return to how
-they were before it, from the copies kept in ``undo/RUN/``. What you said to your AIs (the
-turns) is never undone: ``neocore forget`` deletes those for good, and it also deletes every
+they were before it, from the copies kept in ``undo/RUN/``. A message a correction withdrew
+(``neocore correct``) is restored, with the facts that rested on it. What you said to your AIs
+(the turns) is never deleted by an undo: ``neocore forget`` deletes those for good, and it also deletes every
 undo copy, since a copy may hold text derived from what is being forgotten. Runs are undone
 newest first: a run whose files a later run also changed waits for that later run's undo.
 """
@@ -100,16 +101,24 @@ def run(memory: Any, what: str, by: str = "neocore") -> Iterator[dict[str, Any]]
     try:
         yield record
     finally:
+        # Keys starting "_" go to the undo copy only, never the log (they may hold fact text):
+        # "_withdrawn" messages this run withdrew, "_facts_back" the facts that purged,
+        # "_withdraw_on_undo" messages this run stored that an undo withdraws again.
+        private = {key[1:]: record.pop(key) for key in list(record) if key.startswith("_")}
+        withdrawn = list(private.get("withdrawn") or [])
         facts = _facts_since(memory.store, started)
         changed = [name for name in STATE_FILES if _digest(home / name) != before[name]]
-        if not facts and not changed:
+        if not facts and not changed and not withdrawn:
             shutil.rmtree(folder, ignore_errors=True)
         else:
             (folder / "run.json").write_text(json.dumps(
                 {"run": run_id, "facts": facts, "files": changed,
-                 "absent": [n for n in changed if not before[n]]}), encoding="utf-8")
+                 "absent": [n for n in changed if not before[n]], "withdrawn": withdrawn,
+                 "facts_back": private.get("facts_back") or [],
+                 "withdraw_on_undo": private.get("withdraw_on_undo") or []}), encoding="utf-8")
+            extra = {"messages_withdrawn": len(withdrawn)} if withdrawn else {}
             log(home, {"what": what, "run": run_id, "by": by, "facts_added": len(facts),
-                       "files_changed": changed, **record})
+                       "files_changed": changed, **extra, **record})
             _prune(home)
 
 
@@ -146,6 +155,17 @@ def undo(memory: Any, run_id: str) -> dict[str, Any]:
         raise ValueError("undo these later runs first: " + ", ".join(later))
     folder = home / UNDO / run_id
     deleted = memory.recall_engine.delete_facts(target["facts"])
+    for evidence_id in target.get("withdraw_on_undo") or []:
+        memory.store.revoke(evidence_id, reason="undo " + run_id, by="user")
+    withdrawn = target.get("withdrawn") or []
+    for evidence_id in withdrawn:
+        memory.store.restore(evidence_id, reason="undo " + run_id, by="user")
+    back = memory.recall_engine.put_facts(target.get("facts_back") or [])
+    if withdrawn or target.get("withdraw_on_undo"):
+        memory.recall_engine.refresh()
+        # Its facts are back already: no background pass forms them again.
+        cited = {s for fact in target.get("facts_back") or [] for s in fact["sources"]}
+        memory.recall_engine._mark_formed([e for e in withdrawn if e in cited], "formed")
     for name in target["files"]:
         if name in target.get("absent", []):
             (home / name).unlink(missing_ok=True)
@@ -157,5 +177,7 @@ def undo(memory: Any, run_id: str) -> dict[str, Any]:
     shutil.rmtree(folder, ignore_errors=True)
     result = {"what": "undo", "run": run_id, "facts_deleted": deleted,
               "files_restored": target["files"]}
+    if withdrawn:
+        result.update(messages_restored=len(withdrawn), facts_restored=back)
     log(home, result)
     return result

@@ -15,6 +15,8 @@
     neocore export DIR              the memory as Markdown notes (opens as an Obsidian vault)
     neocore backup FILE | restore FILE [--force]   the memory as one file, and back
     neocore undo [RUN | --list]     take one background pass back (``neocore changes``)
+    neocore hygiene [--apply]       duplicates, clashing numbers, overlapping rules (no model)
+    neocore correct ID [--to TEXT] [--apply]   what rests on a fact or message, then fix it
     neocore connect --url URL --key-file FILE [--ssh HOST --socket PATH] [--tools-only]
     neocore disconnect
     neocore server init | serve | keys | scopes | audit | export | forget  (shared memory)
@@ -597,8 +599,10 @@ def undo_command(argv: list[str]) -> None:
     if args.list or not args.run:
         found = changes.runs(memory.HOME)
         for run in found:
+            withdrawn = len(run.get("withdrawn") or [])
             print(f"{run['run']}  {len(run['facts'])} facts added, files: "
-                  f"{', '.join(run['files']) or 'none'}")
+                  f"{', '.join(run['files']) or 'none'}"
+                  + (f", {withdrawn} message(s) withdrawn" if withdrawn else ""))
         if not found:
             print("Nothing to undo.")
         return
@@ -608,6 +612,68 @@ def undo_command(argv: list[str]) -> None:
         sys.exit(f"no run {args.run} to undo (`neocore undo --list`)")
     except ValueError as error:
         sys.exit(str(error))
+
+
+def hygiene_command(argv: list[str]) -> None:
+    """``neocore hygiene [--apply] [--json]``: duplicates, clashing numbers, overlapping rules."""
+    from neocore.assistant import hygiene
+
+    parser = argparse.ArgumentParser(prog="neocore hygiene")
+    parser.add_argument("--apply", action="store_true",
+                        help="merge the duplicates (one undoable change); nothing else changes")
+    parser.add_argument("--scope", default=memory.SCOPE)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    dev = memory.DevMemory()
+    if args.apply:
+        print(json.dumps(hygiene.merge_duplicates(dev, args.scope), indent=1))
+        return
+    found = hygiene.report(dev, args.scope)
+    if args.json:
+        print(json.dumps(found, indent=1, ensure_ascii=False))
+        return
+    print(f"{found['facts_checked']} current facts checked, no model call.\n")
+    print(f"Same wording, not merged yet: {found['duplicate_groups']} group(s)"
+          + (" (`neocore hygiene --apply` keeps the newest of each)" if found["duplicates"]
+             else ""))
+    for group in found["duplicates"][:10]:
+        print(f"  {len(group)}x  {group[-1]['text'][:110]}")
+    print(f"\nSame subject, different numbers: {found['contradiction_pairs']} pair(s)")
+    for pair in found["possible_contradictions"][:15]:
+        print(f"  {pair['older']['at'][:10]} {pair['older']['id']}: {pair['older']['text'][:100]}")
+        print(f"  {pair['newer']['at'][:10]} {pair['newer']['id']}: {pair['newer']['text'][:100]}")
+        print("    if the older one is wrong: neocore correct "
+              f"{pair['older']['id']} --to \"...\" --apply\n")
+    print(f"Learnt rules on overlapping topics: {len(found['overlapping_rules'])}")
+    for one, two in found["overlapping_rules"]:
+        print(f"  {one['id']} \"{one['rule']}\"  /  {two['id']} \"{two['rule']}\"")
+
+
+def correct_command(argv: list[str]) -> None:
+    """``neocore correct ID [--to TEXT] [--apply]``: what rests on it, then the correction."""
+    from neocore.assistant import hygiene
+
+    parser = argparse.ArgumentParser(prog="neocore correct")
+    parser.add_argument("id", help="a fact id (fact_...) or a message id (from recall/search)")
+    parser.add_argument("--to", default="", help="for a fact: what is true instead")
+    parser.add_argument("--reason", default="")
+    parser.add_argument("--apply", action="store_true",
+                        help="make the correction (one undoable change); without it, only show")
+    parser.add_argument("--scope", default=memory.SCOPE)
+    args = parser.parse_args(argv)
+    dev = memory.DevMemory()
+    try:
+        result = (hygiene.correct(dev, args.id, to=args.to, reason=args.reason, scope=args.scope)
+                  if args.apply else hygiene.blast_radius(dev, args.id, args.scope))
+    except KeyError:
+        sys.exit(f"no fact or message {args.id} in this memory")
+    except ValueError as error:
+        sys.exit(str(error))
+    print(json.dumps(result, indent=1, ensure_ascii=False))
+    if not args.apply:
+        print("\nNothing changed. Add --apply" + (' (and --to "what is true")'
+                                                  if result["kind"] == "fact" else "")
+              + " to correct it; `neocore undo` takes it back.")
 
 
 def _set_up_by_hand(command: str) -> bool:
@@ -650,6 +716,12 @@ def main(argv: list[str] | None = None) -> None:
         return
     if argv[:1] == ["undo"]:
         undo_command(argv[1:])
+        return
+    if argv[:1] == ["hygiene"]:
+        hygiene_command(argv[1:])
+        return
+    if argv[:1] == ["correct"]:
+        correct_command(argv[1:])
         return
     if argv[:1] == ["prefs"]:
         prefs_command(argv[1:] or ["list"])

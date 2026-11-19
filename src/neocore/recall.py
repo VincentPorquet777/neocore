@@ -471,6 +471,41 @@ class GovernedRecall:
                 deleted += 1
         return deleted
 
+    def fact_records(self, fact_ids: Sequence[str]) -> list[dict[str, Any]]:
+        """These facts as they are stored, with their sources, for ``put_facts`` later."""
+        out = []
+        for fact_id in fact_ids:
+            row = self.store.rows("SELECT fact_id,occurred_at,text,former,formed_at FROM "
+                                  "recall_facts WHERE fact_id=?", (fact_id,))
+            if row:
+                out.append({**{k: str(row[0][k]) for k in
+                               ("fact_id", "occurred_at", "text", "former", "formed_at")},
+                            "sources": [str(r["evidence_id"]) for r in self.store.rows(
+                                "SELECT evidence_id FROM recall_fact_sources WHERE fact_id=?",
+                                (fact_id,))]})
+        return out
+
+    def put_facts(self, facts: Sequence[dict[str, Any]]) -> int:
+        """Store facts kept by ``fact_records`` again, exactly as they were (``neocore undo`` of a
+        withdrawn message: the facts it purged come back without a model call)."""
+        put = 0
+        with self.store.connection() as connection:
+            for fact in facts:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO recall_facts(fact_id,occurred_at,text,former,formed_at) "
+                    "VALUES(?,?,?,?,?)", tuple(fact[k] for k in
+                                               ("fact_id", "occurred_at", "text", "former",
+                                                "formed_at")))
+                if not cursor.rowcount:
+                    continue
+                connection.execute("INSERT INTO recall_facts_fts(rowid,text) VALUES(?,?)",
+                                   (cursor.lastrowid, fact["text"]))
+                connection.executemany(
+                    "INSERT OR IGNORE INTO recall_fact_sources(fact_id,evidence_id) VALUES(?,?)",
+                    [(fact["fact_id"], s) for s in fact["sources"]])
+                put += 1
+        return put
+
     def _embed_missing(self, select: str, insert: str, limit: int | None, batch: int = 64) -> int:
         from array import array
 

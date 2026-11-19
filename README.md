@@ -225,6 +225,34 @@ and it deletes every undo copy with them, since a copy may hold text derived fro
 forgotten. Passes are undone newest first when they changed the same files. The copies cost no
 disk space until a file changes (hard links), and the last 30 passes are kept.
 
+## Hygiene and corrections
+
+```bash
+neocore hygiene                          # report only, no model call
+neocore hygiene --apply                  # merge same-wording duplicates (one undoable change)
+neocore correct FACT_ID                  # what rests on this fact
+neocore correct FACT_ID --to "The memory server listens on 8795." --apply
+neocore correct MESSAGE_ID --apply       # withdraw a wrong message and the facts formed from it
+```
+
+Fact and message ids are the ones `neocore_search` and `neocore_open` show your AIs.
+
+- **`hygiene`** lists facts with the same wording that are not merged yet, facts on the same
+  subject that give different values (a port, a version, an amount) where nothing yet says which
+  is current, and learnt rules on overlapping topics. Only duplicates are ever changed.
+- **`correct`** first shows the blast radius: the facts formed from the same messages, the lessons
+  among them, and whether the briefing uses any of them. With `--apply` a fact correction is stored
+  as a note plus a new fact, and the wrong fact is marked replaced by it (recall shows the
+  correction beside it). A withdrawn message takes its facts out of recall at once.
+- Both go through the change log: `neocore undo` takes a correction back, a withdrawn message and
+  its facts included, without a model call.
+
+Measured on a real memory of 17,323 facts that the background pass (sleep) already tidies: the
+report took 2 s and flagged nothing. Against the 1,563 pairs sleep's model had judged replaced,
+the value check would have caught 6; lowering its threshold to catch 33 mostly flagged different
+projects that happen to carry different version numbers. So it is a free safety net, strict on
+purpose, for memories without sleep; it does not replace sleep.
+
 ## Read it, keep it: Markdown export and one-file backup
 
 ```bash
