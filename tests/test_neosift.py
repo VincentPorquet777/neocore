@@ -24,6 +24,59 @@ def _fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(neosift, "_STATE", {"down": 0.0, "starts": 0, "next": 0.0})
 
 
+def test_server_tokens_match_pair_encoding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    tokenizers = pytest.importorskip("tokenizers")
+    from safetensors.torch import save_file
+
+    from neocore import neosift_server as server
+
+    # Exercise the standalone scorer without downloading a tokenizer or model.
+    vocab = {word: i for i, word in enumerate(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "a", "b"])}
+    backend = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.WhitespaceSplit()
+    backend.post_processor = tokenizers.processors.TemplateProcessing(
+        single="[CLS] $A [SEP]", pair="[CLS] $A [SEP] $B [SEP]",
+        special_tokens=[("[CLS]", vocab["[CLS]"]), ("[SEP]", vocab["[SEP]"])],
+    )
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, pad_token="[PAD]", unk_token="[UNK]",
+        cls_token="[CLS]", sep_token="[SEP]",
+    )
+    tokenizer.save_pretrained(tmp_path)
+    config = transformers.BertConfig(vocab_size=len(vocab), hidden_size=8, num_hidden_layers=1,
+                                     num_attention_heads=2, intermediate_size=12)
+    config.save_pretrained(tmp_path)
+    save_file(server.NeoSift(config).state_dict(), str(tmp_path / "model.safetensors"))
+    # The three template tokens leave an odd budget. With two long inputs, the original
+    # lengths determine which side keeps the last token.
+    (tmp_path / "neosift.json").write_text('{"name": "test", "max_length": 20}')
+    monkeypatch.setattr(server, "MODEL_DIR", tmp_path)
+    monkeypatch.setattr(server, "device", lambda: "cpu")
+    scorer = server.Scorer()
+    observed = []
+
+    def capture(_model, args, kwargs):
+        observed.append(args if args else (kwargs["input_ids"], kwargs["attention_mask"]))
+
+    scorer.model.register_forward_pre_hook(capture, with_kwargs=True)
+
+    texts = ["", "a [PAD] b", "b " * 20, "a " * 605] * 16 + ["b", "a b", "b"]
+    kinds = ["fact" if i % 2 else "excerpt" for i in range(len(texts))]
+    for prompt in ("", "a b", "a " * 40):
+        observed.clear()
+        assert len(scorer(prompt, [], texts, kinds)) == len(texts)
+        assert len(observed) == 2
+        for start, (ids, mask) in zip((0, 64), observed):
+            batch = [f"({kind}) {text[:900]}" for kind, text in
+                     zip(kinds[start:start + 64], texts[start:start + 64])]
+            expected = tokenizer([prompt] * len(batch), batch, truncation="longest_first",
+                                 max_length=20, padding=True, return_tensors="pt")
+            assert torch.equal(ids, expected["input_ids"])
+            assert torch.equal(mask, expected["attention_mask"])
+
+
 def _memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DevMemory:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     _jsonl(tmp_path / ".claude/projects/p/a.jsonl",

@@ -26,8 +26,10 @@ import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors.torch import load_file
+from tokenizers import Encoding, Tokenizer, models
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 HOME = Path(__file__).resolve().parent
@@ -79,7 +81,17 @@ class Scorer:
     def __init__(self) -> None:
         info = json.loads((MODEL_DIR / "neosift.json").read_text(encoding="utf-8"))
         self.name, self.max_length = info["name"], int(info.get("max_length", 512))
-        self.tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+        self.tok = tokenizer.backend_tokenizer
+        self.tok.no_padding()
+        self.tok.no_truncation()
+        # Longest-first needs both original lengths. This second processor only pairs existing
+        # encodings, so it needs the model's template but no vocabulary of its own.
+        self.pairs = Tokenizer(models.WordLevel())
+        self.pairs.post_processor = self.tok.post_processor
+        self.pairs.enable_truncation(max_length=self.max_length, strategy="longest_first",
+                                     direction=tokenizer.truncation_side)
+        self.pad_id = tokenizer.pad_token_id
         self.model = NeoSift(AutoConfig.from_pretrained(MODEL_DIR))
         self.model.load_state_dict(load_file(str(MODEL_DIR / "model.safetensors")))
         self.device = device()
@@ -88,21 +100,30 @@ class Scorer:
         self.bf16 = self.device == "cuda" and torch.cuda.get_device_capability()[0] >= 8
         self.lock = threading.Lock()
 
+    def _batch(self, side: Encoding, memories: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        # Use the tokenizer's own pair template and longest-first truncation for each memory.
+        encoded = self.tok.encode_batch_fast(memories, add_special_tokens=False)
+        rows = [self.pairs.post_process(side, memory).ids for memory in encoded]
+        lengths = np.asarray([len(row) for row in rows])
+        width = int(lengths.max())
+        ids = np.full((len(rows), width), self.pad_id, dtype=np.int64)
+        for index, row in enumerate(rows):
+            ids[index, :len(row)] = row
+        # Literal [PAD] tokens in an input are attended. Only the appended padding is masked.
+        mask = (np.arange(width) < lengths[:, None]).astype(np.int64)
+        return torch.from_numpy(ids).to(self.device), torch.from_numpy(mask).to(self.device)
+
     def __call__(self, prompt: str, context: list[dict], texts: list[str],
                  kinds: list[str]) -> list[float]:
-        side = prompt_side(prompt, context)
         scores: list[float] = []
         with self.lock, torch.inference_mode():
+            side = self.tok.encode(prompt_side(prompt, context), add_special_tokens=False)
             for k in range(0, len(texts), 64):
-                batch = texts[k:k + 64]
-                enc = self.tok([side] * len(batch),
-                               [f"({kind}) {text[:900]}" for kind, text in
-                                zip(kinds[k:k + 64], batch)],
-                               truncation="longest_first", max_length=self.max_length,
-                               padding=True, return_tensors="pt")
-                enc = {n: v.to(self.device) for n, v in enc.items()}
+                memories = [f"({kind}) {text[:900]}" for kind, text in
+                            zip(kinds[k:k + 64], texts[k:k + 64])]
+                ids, mask = self._batch(side, memories)
                 with torch.autocast(self.device, dtype=torch.bfloat16, enabled=self.bf16):
-                    scores += torch.sigmoid(self.model(**enc).float()).tolist()
+                    scores += torch.sigmoid(self.model(ids, mask).float()).tolist()
         return scores
 
 
