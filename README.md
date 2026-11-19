@@ -126,11 +126,19 @@ Useful commands:
 ```bash
 neocore recall "how did we deploy the worker last time"
 neocore status            # counts and configuration
-neocore stats --days 7    # live relevance, latency and error estimates
+neocore stats --days 7    # live relevance, latency, errors, and prompt cost (below)
 neocore forget claude-code:<session-id>   # erase a conversation for good (audited)
 neocore sift status       # NeoSift: installed, graphics card, in use
 neocore share status      # opt-in sharing: on/off, rows waiting and sent
 ```
+
+Recall makes no model call, but the answering model still reads what it adds, and where that
+text sits decides whether the host's prompt cache survives. NeoCore attaches it to the newest
+message, after the stable system prompt, so the cached prefix is untouched. `neocore stats`
+shows the real price under `prompt_cost`: per host, the memory that actually reached a chat
+(estimated tokens) next to the fresh input, cache reads and cache writes Claude Code and Codex
+recorded for their model calls in the same days. It reads only their usage counts, never the
+conversation text.
 
 ## Rules check: your standing rules, at the moment of action
 
@@ -330,7 +338,7 @@ recall step makes no model calls. Reader and judge are the only models. See
 
 | Benchmark | Questions | NeoCore | Reader / judge | Recall p50 | Cost |
 | --- | --- | --- | --- | --- | --- |
-| LoCoMo (10 conversations, categories 1â€“4) | 1,540 | **87.5%** | gpt-4.1-mini / gpt-4o-mini | 22 ms | $2.42 |
+| LoCoMo (10 conversations, categories 1–4) | 1,540 | **87.5%** | gpt-4.1-mini / gpt-4o-mini | 22 ms | $2.42 |
 | LongMemEval-S | 500 | **89.6%** | gpt-4.1-mini / gpt-4o (official prompts) | 20 ms | $1.52 |
 | Governance (leaks) | 1,540 | **0** (control: 1,540) | none | 14 ms | $0 |
 
