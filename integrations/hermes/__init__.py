@@ -387,6 +387,8 @@ class NeoCoreMemoryProvider(MemoryProvider):
         return NAME
 
     def is_available(self) -> bool:
+        if os.environ.get("NEOCORE_DISABLED"):
+            return False  # a call NeoCore itself made (its background AI) never uses memory
         try:
             import neocore  # noqa: F401
         except ImportError:

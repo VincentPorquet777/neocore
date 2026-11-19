@@ -3,7 +3,9 @@
 Recall itself never calls a model. The background passes that turn conversations into facts,
 retire stale ones and write lessons use one of:
 
-- ``codex``  (default when installed): the Codex CLI on your own ChatGPT sign-in, no API key.
+- ``hermes`` (default when installed): the Hermes CLI, on the model and provider you set up in
+  Hermes, with no tools, no rules or memory, and no session in your lists.
+- ``codex``  (next when installed): the Codex CLI on your own ChatGPT sign-in, no API key.
 - ``claude``: the Claude Code CLI on your own sign-in.
 - ``openai``: any OpenAI-compatible endpoint (OpenAI, OpenRouter, a local server), with
   ``llm_base_url`` and the key in the environment variable named by ``llm_key_env``.
@@ -34,7 +36,7 @@ _PASS = frozenset({
     "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "OS",
     "NUMBER_OF_PROCESSORS", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME", "USER",
     "LOGNAME", "SHELL", "TERM", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "ALLUSERSPROFILE",
-    "PUBLIC", "TEMP", "TMP", "TMPDIR", "LANG", "LANGUAGE", "TZ", "CODEX_HOME",
+    "PUBLIC", "TEMP", "TMP", "TMPDIR", "LANG", "LANGUAGE", "TZ", "CODEX_HOME", "HERMES_HOME",
     "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_GIT_BASH_PATH", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
     "PYTHONIOENCODING", "PYTHONUTF8", "LD_LIBRARY_PATH", "HF_HOME", "HF_HUB_OFFLINE",
@@ -86,10 +88,16 @@ def find_claude() -> str | None:
     return shutil.which("claude")
 
 
+def find_hermes() -> str | None:
+    return shutil.which("hermes")
+
+
 def backend(config: dict[str, Any]) -> str:
     chosen = str(config.get("llm") or "")
     if chosen:
         return chosen
+    if find_hermes():
+        return "hermes"
     if find_codex():
         return "codex"
     if find_claude():
@@ -101,6 +109,9 @@ def asker(config: dict[str, Any]) -> Ask | None:
     """``ask`` for the configured backend, or None when there is none (recall still works)."""
     chosen = backend(config)
     model = str(config.get("llm_model") or "")
+    if chosen == "hermes":
+        return hermes(str(config.get("hermes_path") or find_hermes() or "hermes"), model,
+                      str(config.get("llm_effort") or "low"))
     if chosen == "codex":
         executable = str(config.get("codex_path") or find_codex() or "codex")
         return codex(executable, model, str(config.get("llm_effort") or "low"))
@@ -133,6 +144,29 @@ def codex(executable: str, model: str = "", effort: str = "low") -> Ask:
                 command, input=prompt, cwd=temp, capture_output=True, text=True,
                 encoding="utf-8", timeout=600, check=True, env=_quiet(), creationflags=_NO_WINDOW)
             return dict(json.loads(answer.read_text(encoding="utf-8")))
+
+    return ask
+
+
+def hermes(executable: str, model: str = "", effort: str = "low") -> Ask:
+    def ask(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="neocore-hermes-") as temp:
+            query = Path(temp) / "query.txt"
+            query.write_text(f"{prompt}\n\nReply with JSON only, matching this JSON Schema:\n"
+                             f"{json.dumps(schema)}", encoding="utf-8")
+            # Hermes reads its own keys and model from its home, so the minimal environment is
+            # enough. No tools (an unknown toolset name enables none), no SOUL.md, rules or memory
+            # (NeoCore's own provider would recurse), one turn, and tagged as a tool session so it
+            # stays out of the user's session lists.
+            command = [executable, "chat", "--query-file", str(query), "--quiet",
+                       "--ignore-rules", "--source", "tool", "--toolsets", "none",
+                       "--max-turns", "1", "--reasoning", effort]
+            if model:
+                command += ["--model", model]
+            completed = subprocess.run(  # noqa: S603
+                command, cwd=temp, capture_output=True, text=True, encoding="utf-8",
+                timeout=600, check=True, env=_quiet(), creationflags=_NO_WINDOW)
+        return _json_in(completed.stdout)
 
     return ask
 

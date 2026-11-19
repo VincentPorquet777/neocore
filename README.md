@@ -262,8 +262,10 @@ print(result.receipt)    # every delivered excerpt: evidence id + character offs
 - `memory.revoke(evidence_id, reason=...)` hides a message until `memory.store.restore(...)`.
 - `memory.forget(evidence_id, reason=...)` deletes the text and keeps an audit tombstone.
 - `memory.abandon_branch(branch_id, reason=...)` drops an edited-away branch.
-- `memory.form_facts(ask)` forms dated facts with any model: `neocore.llm` has Codex CLI, Claude
-  CLI and OpenAI-compatible backends.
+- `memory.form_facts(ask)` forms dated facts with any model: `neocore.llm` has Hermes CLI, Codex
+  CLI, Claude CLI and OpenAI-compatible backends. Without an `llm` setting it uses the first one
+  installed, in that order: Hermes on the model you set up there, then Codex or Claude Code on
+  your own sign-in.
 
 The only required dependency is the Python standard library. `pip install neocore-memory[embed]`
 adds dense recall (numpy, onnxruntime, tokenizers).

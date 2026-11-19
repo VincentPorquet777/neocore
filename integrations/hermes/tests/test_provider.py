@@ -244,3 +244,12 @@ def test_neosift_off_is_never_asked(home):
     assert "Feedzai" in provider.prefetch("Where do I work in Lisbon? Feedzai", session_id="s2")
     assert not asked
     manager.shutdown_all()
+
+
+def test_off_inside_neocores_own_background_calls(monkeypatch):
+    # NeoCore asks the Hermes CLI to write facts with NEOCORE_DISABLED set; that call must not
+    # recall or store memory, or memory would record its own work.
+    provider = plugin.NeoCoreMemoryProvider()
+    assert provider.is_available()
+    monkeypatch.setenv("NEOCORE_DISABLED", "1")
+    assert not provider.is_available()
