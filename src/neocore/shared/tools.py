@@ -397,7 +397,8 @@ TOOLS: list[dict[str, Any]] = [
             "ids. Use it when earlier work, decisions, preferences or history may matter, "
             "beyond what was fed in automatically. kind=facts for settled facts only, "
             "kind=lessons for what went wrong before and what to do instead. "
-            "For original wording or a decision as stated, use kind=turns. The default lists facts first."),
+            "For original wording or a decision as stated, use kind=turns. "
+            "The default lists facts first."),
         "inputSchema": {
             "type": "object",
             "properties": {

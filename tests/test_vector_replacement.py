@@ -89,7 +89,9 @@ def test_fresh_index_spends_its_embedding_budget_in_capture_order(tmp_path: Path
     pytest.importorskip("numpy")
     store = Store(tmp_path / "ordering.db")
     evidence = [store.capture(word, role="user", thread_id=word) for word in ("zulu", "alpha")]
-    recall = GovernedRecall(store, embedder=lambda items: [[1, 0]] * len(items), embedding_model="test")
+    recall = GovernedRecall(
+        store, embedder=lambda items: [[1, 0]] * len(items), embedding_model="test"
+    )
     recall.backfill(limit=1)
     embedded = store.rows(
         "SELECT s.evidence_id FROM recall_vectors v JOIN recall_spans s ON s.span_id=v.span_id"
