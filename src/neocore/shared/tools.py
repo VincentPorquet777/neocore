@@ -44,7 +44,11 @@ def _date(value: Any, name: str) -> str:
         return ""
     if not isinstance(value, str) or not _DATE.match(value):
         raise ToolError(f"{name} must be a date like 2026-10-14")
-    return value
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ToolError(f"{name} must be a valid calendar date") from error
+    return value[:10]
 
 
 def _limit(value: Any, default: int) -> int:
@@ -147,6 +151,8 @@ class Tools:
         result = self.memory.recall_engine.recall(
             query,
             allowed_scopes=set(scopes),
+            since=since,
+            until=until,
             top_spans=0 if kind in ("facts", "lessons") else 48,
             top_facts=0 if kind == "turns" else 80,
             budget_bytes=60_000,
@@ -159,6 +165,11 @@ class Tools:
         excerpts: dict[str, list[Any]] = {}
         for span in result.spans:
             excerpts.setdefault(span.evidence_id, []).append(span)
+        # Close the ranked packet against current authority before rendering search results.
+        visible, support = self.memory.recall_engine.authorized_support(
+            list(excerpts), list(facts), set(scopes))
+        excerpts = {eid: spans for eid, spans in excerpts.items() if eid in visible}
+        facts = {fid: fact for fid, fact in facts.items() if fid in support}
         origin = self._origin(list(excerpts), list(facts))
         hits: list[tuple[str, str, str]] = []  # (id, when, line)
         for fact_id in fact_ids:
@@ -295,6 +306,8 @@ class Tools:
             + " ORDER BY occurred_at DESC LIMIT ?", (*params, limit * 10))]
         candidates = [f for f in candidates if f not in hidden and f not in replaced]
         facts = self._readable_facts(candidates, scopes)
+        current = self.memory.recall_engine.fact_support(list(facts), set(scopes))
+        facts = {key: row for key, row in facts.items() if key in current}
         origin = self._origin([], list(facts))
         chosen = [f for f in candidates
                   if f in facts and self._matches(origin.get(f), project, "")][:limit]
@@ -311,7 +324,10 @@ class Tools:
         """The user's briefing for exactly the caller's scopes (``neocore.assistant.profile``)."""
         from neocore.assistant import profile as dev_profile
 
-        text = dev_profile.get(self.memory.home, scopes)
+        text = dev_profile.get(
+            self.memory.home, scopes, rows=self._rows,
+            fact_support=self.memory.recall_engine.fact_support,
+        )
         return (dev_render.PROFILE_HEAD + text if text
                 else "No briefing yet: the next sync writes it from the memory's facts.")
 
@@ -380,7 +396,9 @@ TOOLS: list[dict[str, Any]] = [
             "(Claude Code, Codex and others) across all their machines. Returns dated hits with "
             "ids. Use it when earlier work, decisions, preferences or history may matter, "
             "beyond what was fed in automatically. kind=facts for settled facts only, "
-            "kind=lessons for what went wrong before and what to do instead."),
+            "kind=lessons for what went wrong before and what to do instead. "
+            "For original wording or a decision as stated, use kind=turns. "
+            "The default lists facts first."),
         "inputSchema": {
             "type": "object",
             "properties": {

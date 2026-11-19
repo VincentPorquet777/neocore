@@ -35,11 +35,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from neocore.store import revision_family_key, revision_thread_bucket
 from neocore.temporal import annotate
+
+# The empty bucket preserves older Evidence with missing or non-string turn IDs.
+# CASE also lets an older malformed record coexist with a newly created lookup index.
+_TURN_BUCKET = (
+    "CASE WHEN json_valid(metadata_json) THEN CASE WHEN "
+    "json_type(metadata_json,'$.turn_id')='text' THEN "
+    "json_extract(metadata_json,'$.turn_id') ELSE '' END ELSE '' END"
+)
 
 RECALL_VERSION = "neocore-governed-recall.v1"
 SPAN_CHARACTERS = 700
 _RRF_K = 60
+# Each expansion window binds three parameters. Stay below SQLite's legacy 999 limit.
+_SPAN_READ_BATCH = 200
 _SPEAKER_PREFIX = re.compile(r"^[A-Z][\w .'\-]{0,40}: ")
 _WORD = re.compile(r"[^\W\d_]{2,}")
 _STOP = frozenset(
@@ -155,6 +166,16 @@ class RecalledSpan:
     matched: bool
 
 
+def _recalled_span(row: sqlite3.Row, matched: set[str]) -> RecalledSpan:
+    span_id = str(row["span_id"])
+    return RecalledSpan(
+        span_id=span_id, evidence_id=str(row["evidence_id"]), ordinal=int(row["ordinal"]),
+        start_char=int(row["start_char"]), end_char=int(row["end_char"]),
+        occurred_at=str(row["occurred_at"]), speaker=str(row["speaker"]),
+        text=str(row["anchored_text"]), matched=span_id in matched,
+    )
+
+
 @dataclass
 class RecallResult:
     rendered: str
@@ -163,12 +184,38 @@ class RecallResult:
     receipt: dict[str, Any] = field(default_factory=dict)
 
 
+def _vector_tracking_schema(table: str, key: str) -> str:
+    """Ordinary inserts append cheaply. Changes behind a reader's cursor invalidate that table."""
+    bump = (
+        f"INSERT INTO recall_vector_epochs(name,epoch) VALUES('{table}',1) "
+        "ON CONFLICT(name) DO UPDATE SET epoch=epoch+1;"
+    )
+    triggers = {
+        "del": "AFTER DELETE",
+        "upd": "AFTER UPDATE",
+        # SQLite REPLACE does not normally fire delete triggers. Also cover an explicit
+        # rowid being overwritten or inserted below the existing high-water mark.
+        "replace": "BEFORE INSERT",
+        "backfill": "AFTER INSERT",
+    }
+    conditions = {
+        "replace": f" WHEN EXISTS(SELECT 1 FROM {table} WHERE {key}=NEW.{key} OR rowid=NEW.rowid)",
+        "backfill": f" WHEN NEW.rowid < (SELECT max(rowid) FROM {table})",
+    }
+    return "\n".join(
+        f"CREATE TRIGGER IF NOT EXISTS {table}_epoch_{name} {timing} ON {table}"
+        f"{conditions.get(name, '')} BEGIN {bump} END;"
+        for name, timing in triggers.items()
+    )
+
+
 class _VectorCache:
     """In-memory copy of one vector table; only rows added since the last load are read."""
 
     def __init__(self, table: str, key: str) -> None:
         self.table, self.key = table, key
         self.last_rowid = 0
+        self.generation: tuple[str, int] | None = None
         self.index: dict[str, int] = {}
         self.ids: list[str] = []
         self.blocks: list[Any] = []
@@ -177,11 +224,32 @@ class _VectorCache:
     def load(self, store: Any, model: str) -> tuple[list[str], Any]:
         import numpy as np
 
-        rows = store.rows(
-            f"SELECT rowid,{self.key},vector FROM {self.table} "  # noqa: S608
-            "WHERE model=? AND rowid>? ORDER BY rowid",
-            (model, self.last_rowid),
-        )
+        # Keep the epoch and vector rows in one read snapshot. The ordered range scan can
+        # stream by rowid without materializing a temporary sort of every vector on cold start.
+        with store.read_snapshot():
+            try:
+                version = store.rows(
+                    "SELECT coalesce((SELECT epoch FROM recall_vector_epochs WHERE name=?),0) "
+                    "AS epoch", (self.table,),
+                )
+                generation = (model, int(version[0]["epoch"]))
+            except sqlite3.OperationalError as error:
+                if str(error) != "no such table: recall_vector_epochs":
+                    raise
+                # Read-only historical snapshots may predate the tracking table.
+                generation = None
+            same_generation = generation is not None and generation == self.generation
+            after = self.last_rowid if same_generation else 0
+            rows = store.rows(
+                f"SELECT rowid,{self.key},vector FROM {self.table} "
+                "WHERE model=? AND rowid>? ORDER BY rowid", (model, after),
+            )
+        if generation is None or generation != self.generation:
+            self.ids = []
+            self.index = {}
+            self.matrix = None
+            self.last_rowid = 0
+        self.generation = generation
         if rows:
             flat = np.frombuffer(b"".join(bytes(r["vector"]) for r in rows), dtype=np.float32)
             fresh = flat.reshape(len(rows), -1)
@@ -232,12 +300,25 @@ class GovernedRecall:
         # Measured on LoCoMo and LongMemEval-S: dense evidence outranks lexical 2:1 in the fusion.
         self.dense_weight = dense_weight
         self._coverage = 1.0  # share of the permitted history the last dense ranking could see
+        self._span_owners: tuple[object, dict[str, str]] | None = None
         # Recall must stay fast: it embeds at most this many new rows; ``backfill`` does the rest.
         self.foreground_embed_limit = foreground_embed_limit
         self._span_vectors = _VectorCache("recall_vectors", "span_id")
         self._fact_vectors = _VectorCache("recall_fact_vectors", "fact_id")
         with self.store.connection() as connection:
             connection.executescript(_SCHEMA)
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS recall_evidence_turn "
+                f"ON evidence(coalesce(thread_id,''),{_TURN_BUCKET}) "
+                "WHERE source_type='conversation'"
+            )
+            tracking = (
+                "CREATE TABLE IF NOT EXISTS recall_vector_epochs "
+                "(name TEXT PRIMARY KEY, epoch INTEGER NOT NULL);"
+            )
+            for cache in (self._span_vectors, self._fact_vectors):
+                tracking += _vector_tracking_schema(cache.table, cache.key)
+            connection.executescript(tracking)
 
     # -- index -----------------------------------------------------------------------------
 
@@ -263,6 +344,8 @@ class GovernedRecall:
                 "AND coalesce((SELECT d.state FROM evidence_access d "
                 "WHERE d.evidence_id=e.evidence_id "
                 "ORDER BY d.created_at DESC,d.disposition_id DESC LIMIT 1),'active')='active'"
+                # An index on turn identity must not reorder the bounded embedding backlog.
+                " ORDER BY e.rowid"
             ).fetchall()
             for row in rows:
                 evidence_id = str(row["evidence_id"])
@@ -327,7 +410,7 @@ class GovernedRecall:
             counts["vectors_added"] = self._embed_missing(
                 "SELECT s.span_id AS id,s.anchored_text AS text FROM recall_spans s "
                 "LEFT JOIN recall_vectors v ON v.span_id=s.span_id AND v.model=? "
-                "WHERE v.span_id IS NULL LIMIT ?",
+                "WHERE v.span_id IS NULL ORDER BY s.rowid LIMIT ?",
                 "INSERT OR REPLACE INTO recall_vectors(span_id,model,vector) VALUES(?,?,?)",
                 limit,
             )
@@ -336,7 +419,7 @@ class GovernedRecall:
             counts["fact_vectors_added"] = self._embed_missing(
                 "SELECT f.fact_id AS id,f.text AS text FROM recall_facts f "
                 "LEFT JOIN recall_fact_vectors v ON v.fact_id=f.fact_id AND v.model=? "
-                "WHERE v.fact_id IS NULL LIMIT ?",
+                "WHERE v.fact_id IS NULL ORDER BY f.rowid LIMIT ?",
                 "INSERT OR REPLACE INTO recall_fact_vectors(fact_id,model,vector) VALUES(?,?,?)",
                 limit,
             )
@@ -578,6 +661,8 @@ class GovernedRecall:
         window: int = 1,
         budget_bytes: int = 24_000,
         top_facts: int = 60,
+        since: str = "",
+        until: str = "",
         facts_share: float = 0.3,
         focus_turns: int = 0,
         focus_share: float = 0.4,
@@ -588,13 +673,23 @@ class GovernedRecall:
             self.refresh(embed_limit=self.foreground_embed_limit)
         excluded = set(exclude_evidence_ids)
         permitted = self._permitted_evidence(allowed_scopes, excluded)
+        span_sources = permitted
+        dated_facts = None
+        if since or until:
+            if top_spans > 0:
+                span_sources = permitted & self._dated_ids("evidence", "evidence_id",
+                                                           "timestamp", since, until)
+            if top_facts > 0:
+                dated_facts = self._dated_ids("recall_facts", "fact_id", "occurred_at", since, until)
         query_vector = self._query_vector(inquiry)
-        hits = self._rank_spans(inquiry, permitted, top_spans, query_vector)
-        dense_coverage = round(self._coverage, 3) if query_vector is not None else 0.0
+        hits = self._rank_spans(inquiry, span_sources, top_spans, query_vector)
+        dense_coverage = (
+            round(self._coverage, 3) if query_vector is not None and top_spans > 0 else 0.0
+        )
         spans = self._expand(hits, window)
         if focus_turns:
             spans = self._focus(hits, spans, focus_turns, int(budget_bytes * focus_share))
-        facts = self._rank_facts(inquiry, permitted, top_facts, query_vector)
+        facts = self._rank_facts(inquiry, permitted, top_facts, query_vector, dated_facts)
         rendered, delivered_spans, delivered_facts = _render(
             spans, budget_bytes, facts=facts, facts_share=facts_share
         )
@@ -635,8 +730,21 @@ class GovernedRecall:
 
         return np.asarray(self.query_embedder([inquiry])[0], dtype=np.float32)
 
+    def _dated_ids(self, table: str, ident: str, date: str, since: str, until: str) -> set[str]:
+        # A calendar window limits nominations, not the Evidence that must authorize a fact.
+        where, values = [], []
+        if since:
+            where.append(f"substr({date},1,10) >= ?")
+            values.append(since)
+        if until:
+            where.append(f"substr({date},1,10) <= ?")
+            values.append(until)
+        return {str(r[ident]) for r in self.store.rows(
+            f"SELECT {ident} FROM {table} WHERE {' AND '.join(where)}", tuple(values))}
+
     def _rank_facts(
-        self, inquiry: str, permitted: set[str], limit: int, query_vector: Any
+        self, inquiry: str, permitted: set[str], limit: int, query_vector: Any,
+        dated_facts: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Facts whose every source Evidence is permitted, ranked like spans."""
 
@@ -648,23 +756,19 @@ class GovernedRecall:
         ):
             sources.setdefault(str(row["fact_id"]), []).append(str(row["evidence_id"]))
         allowed = {f for f, ids in sources.items() if set(ids) <= permitted}
+        if dated_facts is not None:
+            allowed &= dated_facts
         if not allowed:
             return []
         rankings: list[tuple[float, list[str]]] = []
         terms = query_terms(inquiry)
         if terms:
             match = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
-            lexical = [
-                str(r["fact_id"])
-                for r in self.store.rows(
-                    "SELECT f.fact_id FROM recall_facts_fts x JOIN recall_facts f "
-                    "ON f.rowid=x.rowid WHERE recall_facts_fts MATCH ? "
-                    "ORDER BY bm25(recall_facts_fts) LIMIT ?",
-                    (match, limit * 8),
-                )
-                if str(r["fact_id"]) in allowed
-            ]
-            rankings.append((1.0, lexical[: limit * 2]))
+            rows = self._lexical_pool(
+                "SELECT f.fact_id FROM recall_facts_fts x JOIN recall_facts f "
+                "ON f.rowid=x.rowid WHERE recall_facts_fts MATCH ?",
+                "bm25(recall_facts_fts)", "f.fact_id", allowed, match, limit * 2, limit * 8)
+            rankings.append((1.0, [str(r["fact_id"]) for r in rows]))
         if query_vector is not None:
             nearest = self._nearest(self._fact_vectors, query_vector, allowed, limit * 2)
             rankings.append((self.dense_weight * self._coverage, nearest))
@@ -735,19 +839,114 @@ class GovernedRecall:
                     break
         return out
 
-    def _permitted_evidence(self, allowed_scopes: set[str], excluded: set[str]) -> set[str]:
+    def authorized_support(
+        self, evidence_ids: Sequence[str], fact_ids: Sequence[str], scopes: set[str],
+        *, excluded: Sequence[str] = (),
+    ) -> tuple[set[str], dict[str, tuple[str, ...]]]:
+        """Resolve current authority for this packet in one short database snapshot."""
+        if not evidence_ids and not fact_ids:
+            return set(), {}
+        store = self.store
+        with store.read_snapshot():
+            sources: dict[str, list[str]] = {}
+            if fact_ids:
+                for row in store.rows(
+                    "SELECT s.fact_id,s.evidence_id FROM recall_fact_sources s "
+                    "JOIN recall_facts f ON f.fact_id=s.fact_id WHERE s.fact_id IN "
+                    "(SELECT value FROM json_each(?)) ORDER BY s.fact_id,s.evidence_id",
+                    (json.dumps(list(fact_ids)),),
+                ):
+                    sources.setdefault(str(row["fact_id"]), []).append(str(row["evidence_id"]))
+            wanted = set(evidence_ids)
+            for ids in sources.values():
+                wanted.update(ids)
+            permitted = self._permitted_evidence(set(scopes), set(excluded), only=wanted)
+            return permitted.intersection(evidence_ids), {
+                fact: tuple(ids) for fact, ids in sources.items() if permitted.issuperset(ids)
+            }
+
+    def authorized_items(
+        self, items: list[dict[str, Any]], scopes: set[str], *, excluded: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
+        """Bind prospective scorer inputs or recheck a previously selected packet."""
+        excerpts = [i["id"] for i in items if i["kind"] == "excerpt"]
+        facts = [i["id"] for i in items if i["kind"] == "fact"]
+        visible, support = self.authorized_support(excerpts, facts, scopes, excluded=excluded)
+        safe = []
+        for item in items:
+            if item["kind"] == "excerpt" and item["id"] in visible:
+                safe.append(item)
+            elif item["kind"] == "fact":
+                exact = support.get(item["id"])
+                if exact and tuple(item.get("source_evidence_ids", exact)) == exact:
+                    safe.append({**item, "source_evidence_ids": exact})
+        return safe
+
+    def fact_support(
+        self, fact_ids: Sequence[str], scopes: set[str],
+    ) -> dict[str, tuple[str, ...]]:
+        return self.authorized_support((), fact_ids, scopes)[1]
+
+    def recent_context(
+        self, thread: str, scopes: set[str], since: str, limit: int,
+    ) -> list[Any]:
+        """Return the latest permitted messages, with the same revision rules as ranking."""
+        store = self.store
+        with store.read_snapshot():
+            candidates = store.rows(
+                "SELECT evidence_id FROM evidence WHERE thread_id=? AND timestamp>=? "
+                "AND sensitivity IN (SELECT value FROM json_each(?))",
+                (thread, since, json.dumps(sorted(scopes))),
+            )
+            wanted = {str(r["evidence_id"]) for r in candidates}
+            visible = self._permitted_evidence(scopes, set(), only=wanted)
+            return list(store.rows(
+                "SELECT speaker,content,timestamp,evidence_id FROM evidence WHERE evidence_id IN "
+                "(SELECT value FROM json_each(?)) ORDER BY timestamp DESC,rowid DESC LIMIT ?",
+                (json.dumps(sorted(visible)), limit),
+            ))
+
+    def _permitted_evidence(self, allowed_scopes: set[str], excluded: set[str],
+                            only: set[str] | None = None) -> set[str]:
         """Evidence IDs recall may read: scope, active access, current branch, latest revision."""
 
-        scopes = sorted(allowed_scopes)
+        if not allowed_scopes or only == set():
+            return set()
+        params = [json.dumps(sorted(allowed_scopes))]
+        source = "source_type='conversation'"
+        scopes = "sensitivity IN (SELECT value FROM json_each(?))"
+        if only is None:
+            where = (f"{source} AND coalesce(thread_id,'') IN ("
+                     f"SELECT coalesce(thread_id,'') FROM evidence WHERE {source} AND {scopes})")
+        else:
+            # Find competing revisions before applying the caller's scope. A normal turn
+            # needs its own bucket and the legacy bucket. A legacy target needs its whole
+            # thread, since its normalized family can match an ordinary string turn ID.
+            where = f"""rowid IN (
+                WITH wanted(thread,turn) AS (
+                    SELECT DISTINCT coalesce(thread_id,''),{_TURN_BUCKET} FROM evidence
+                    WHERE {source} AND {scopes}
+                      AND evidence_id IN (SELECT value FROM json_each(?))
+                ), probes(thread,turn) AS (
+                    SELECT thread,turn FROM wanted UNION SELECT thread,'' FROM wanted
+                )
+                SELECT evidence.rowid FROM probes CROSS JOIN evidence
+                WHERE {source} AND coalesce(thread_id,'')=probes.thread
+                  AND {_TURN_BUCKET}=probes.turn
+                UNION ALL
+                SELECT evidence.rowid FROM wanted CROSS JOIN evidence
+                WHERE wanted.turn='' AND {source} AND coalesce(thread_id,'')=wanted.thread
+            )"""
+            params.append(json.dumps(sorted(only)))
         rows = self.store.rows(
-            "SELECT evidence_id,metadata_json,thread_id FROM evidence "
-            "WHERE source_type='conversation' AND sensitivity IN "
-            f"({','.join('?' for _ in scopes)})",  # noqa: S608
-            tuple(scopes),
+            "SELECT evidence_id,sensitivity,thread_id,"
+            "json_extract(metadata_json,'$.conversation_branch_id') AS branch,"
+            "json_extract(metadata_json,'$.turn_id') AS turn,"
+            "json_extract(metadata_json,'$.experience_role') AS role,"
+            "json_extract(metadata_json,'$.turn_revision_id') AS revision "
+            f"FROM evidence WHERE {where} ORDER BY rowid",
+            tuple(params),
         )
-        latest: dict[tuple[str, str, str, str], tuple[str, list[str]]] = {}
-        # One pass over dispositions (latest wins), not one query per branch: a real store has
-        # a branch per session. Same rule as Store.abandon_branch(); no entry = current.
         branch_status: dict[str, str] = {
             str(r["branch_id"]): str(r["disposition"])
             for r in self.store.rows(
@@ -755,50 +954,102 @@ class GovernedRecall:
                 "ORDER BY created_at,disposition_id"
             )
         }
-        for row in rows:
-            evidence_id = str(row["evidence_id"])
-            if evidence_id in excluded:
-                continue
-            metadata = json.loads(str(row["metadata_json"] or "{}"))
-            branch = str(metadata.get("conversation_branch_id") or "")
+        winners: dict[tuple[str, str, str, str], tuple[str, str, str | None]] = {}
+        edited: dict[tuple[str, str, str, str], list[tuple[str, str, str | None]]] = {}
+        for evidence_id, scope, thread, branch, turn, role, revision in rows:
+            branch = str(branch or "")
             if branch and branch_status.get(branch, "current") != "current":
                 continue
-            role = str(metadata.get("experience_role") or "")
-            turn = str(metadata.get("turn_id") or evidence_id)
-            key = (str(row["thread_id"] or ""), branch, turn, role)
-            revision = str(metadata.get("turn_revision_id") or "")
-            kept = latest.get(key)
-            if kept is None or revision > kept[0]:
-                latest[key] = (revision, [evidence_id])
-        candidates = {ids[0] for _, ids in latest.values()}
-        return candidates - self._inactive_evidence()
+            key = (str(thread or ""), branch, str(turn or evidence_id), str(role or ""))
+            label = "" if revision is None else str(revision)
+            item = (label, evidence_id, scope)
+            if key in winners:
+                edited.setdefault(key, [winners[key]]).append(item)
+            else:
+                winners[key] = item
+        # A read-only pre-migration snapshot has no revision markers and cannot create them.
+        if self.store.rows(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forgotten_revisions'"
+        ):
+            erased: dict[bytes, list[tuple[str, str, str | None]]] = {}
+            for marker_key, label in self.store.rows(
+                "SELECT family_key,revision FROM forgotten_revisions"
+            ):
+                erased.setdefault(marker_key, []).append((label, "", None))
+            if erased:
+                buckets = {k[0] for k in erased}
+                threads = {key[0] for key in winners}
+                possible = {t for t in threads if revision_thread_bucket(t) in buckets}
+                for family, first in winners.items():
+                    if family[0] not in possible:
+                        continue
+                    markers = erased.get(revision_family_key(family))
+                    if markers:
+                        # max() keeps the first tie. Erasure wins at an equal revision rank.
+                        edited[family] = markers + edited.get(family, [first])
+        for key, versions in edited.items():
+            if all(label.isascii() and label.isdecimal() for label, _, _ in versions):
+                # Compare unbounded decimal counters without converting to a machine integer.
+                winners[key] = max(
+                    versions, key=lambda v: (len(v[0].lstrip("0")), v[0].lstrip("0"))
+                )
+            else:
+                # Preserve lexical ordering for legacy opaque and mixed revision families.
+                winners[key] = max(versions, key=lambda v: v[0])
+        candidates = {
+            eid for _, eid, scope in winners.values() if scope is not None and scope in allowed_scopes
+        }
+        # Any ineligible winner suppresses the entire revision family.
+        if only is not None:
+            candidates &= only
+        return candidates - self._inactive_evidence() - excluded
+
+    def _lexical_pool(self, select: str, order: str, column: str, allowed: set[str],
+                      match: str, needed: int, scan: int) -> list[Any]:
+        """Complete the eligible pool when inaccessible hits occupy the ordinary shortlist."""
+        if not allowed or needed <= 0:
+            return []
+        tail = f" ORDER BY {order} LIMIT ?"
+        first = self.store.rows(select + tail, (match, scan))
+        key = column.split(".")[1]
+        eligible = [r for r in first if r[key] in allowed]
+        if len(eligible) >= needed or len(first) < scan:
+            return eligible[:needed]
+        # SQL fragments are constants supplied by the three FTS lanes. The IDs are data.
+        return self.store.rows(select + f" AND {column} IN (SELECT value FROM json_each(?))"
+                               + tail, (match, json.dumps(list(allowed)), needed))
+
+    def _span_evidence(self) -> dict[str, str]:
+        """Cache the index relationship only. Scope, branch, access and revision are read live."""
+        version = getattr(self.store, "read_version", lambda: None)
+        before = version()
+        cached = self._span_owners
+        if before is not None and cached is not None and cached[0] == before:
+            return cached[1]
+        owners = {str(r["span_id"]): str(r["evidence_id"]) for r in
+                  self.store.rows("SELECT span_id,evidence_id FROM recall_spans")}
+        if before is not None and version() == before:
+            self._span_owners = (before, owners)
+        return owners
 
     def _rank_spans(
         self, inquiry: str, permitted: set[str], limit: int, query_vector: Any = None
     ) -> list[sqlite3.Row]:
+        if limit <= 0:
+            return []
         rankings: list[tuple[float, list[str]]] = []
         terms = query_terms(inquiry)
         by_id: dict[str, Any] = {}
         if terms:
             match = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
-            lexical = []
-            for row in self.store.rows(
+            rows = self._lexical_pool(
                 "SELECT s.* FROM recall_spans_fts f JOIN recall_spans s ON s.rowid=f.rowid "
-                "WHERE recall_spans_fts MATCH ? "
-                "ORDER BY bm25(recall_spans_fts), s.occurred_at DESC LIMIT ?",
-                (match, limit * 8),
-            ):
-                if str(row["evidence_id"]) in permitted:
-                    lexical.append(str(row["span_id"]))
-                    by_id[str(row["span_id"])] = row
-            rankings.append((1.0, lexical[: limit * 2]))
+                "WHERE recall_spans_fts MATCH ?", "bm25(recall_spans_fts), s.occurred_at DESC",
+                "s.evidence_id", permitted, match, limit * 2, limit * 8)
+            by_id.update((str(r["span_id"]), r) for r in rows)
+            rankings.append((1.0, list(by_id)))
         if query_vector is not None:
-            evidence_of = {
-                str(r["span_id"]): str(r["evidence_id"])
-                for r in self.store.rows(
-                    "SELECT span_id,evidence_id FROM recall_spans"
-                )
-            }
+            evidence_of = self._span_evidence()
             allowed = {s for s, e in evidence_of.items() if e in permitted}
             nearest = self._nearest(self._span_vectors, query_vector, allowed, limit * 2)
             rankings.append((self.dense_weight * self._coverage, nearest))
@@ -825,19 +1076,16 @@ class GovernedRecall:
                 f"({','.join('?' for _ in missing)})",  # noqa: S608
                 tuple(missing),
             ):
-                by_id[str(row["span_id"])] = row
+                if str(row["evidence_id"]) in permitted:
+                    by_id[str(row["span_id"])] = row
         return [by_id[s] for s in chosen if s in by_id]
 
     def _best_line_of_best_turns(self, match: str, permitted: set[str], limit: int) -> list[str]:
-        turns = [
-            str(r["evidence_id"])
-            for r in self.store.rows(
-                "SELECT e.evidence_id FROM evidence_fts f JOIN evidence e ON e.rowid=f.rowid "
-                "WHERE evidence_fts MATCH ? ORDER BY bm25(evidence_fts) LIMIT ?",
-                (f"content:({match})", limit * 8),
-            )
-            if str(r["evidence_id"]) in permitted
-        ][:limit]
+        rows = self._lexical_pool(
+            "SELECT e.evidence_id FROM evidence_fts f JOIN evidence e ON e.rowid=f.rowid "
+            "WHERE evidence_fts MATCH ?", "bm25(evidence_fts)", "e.evidence_id",
+            permitted, f"content:({match})", limit, limit * 8)
+        turns = [str(r["evidence_id"]) for r in rows]
         if not turns:
             return []
         best: dict[str, str] = {}
@@ -857,53 +1105,65 @@ class GovernedRecall:
         """The best ``turns`` turns read more fully: outward from their matched lines, up to
         ``cap`` bytes each, ahead of the other hits. A matched line often holds the question's
         words while the answer sits a few lines away in the same turn."""
-        top = list(dict.fromkeys(str(h["evidence_id"]) for h in hits))[:turns]
+        anchors: dict[str, list[int]] = {}
+        for hit in hits:
+            anchors.setdefault(str(hit["evidence_id"]), []).append(int(hit["ordinal"]))
+        top = list(anchors)[:turns]
+        matched = {str(h["span_id"]) for h in hits}
         focused: list[RecalledSpan] = []
-        for evidence_id in top:
-            anchors = [int(h["ordinal"]) for h in hits if str(h["evidence_id"]) == evidence_id]
-            rows = self.store.rows(
-                "SELECT * FROM recall_spans WHERE evidence_id=? ORDER BY ordinal", (evidence_id,)
-            )
-            used = 0
-            for row in sorted(rows, key=lambda r: min(abs(int(r["ordinal"]) - a) for a in anchors)):
-                size = len(str(row["anchored_text"]).encode()) + 12
-                if used + size > cap:
-                    continue
-                used += size
-                span_id = str(row["span_id"])
-                focused.append(RecalledSpan(
-                    span_id=span_id, evidence_id=evidence_id, ordinal=int(row["ordinal"]),
-                    start_char=int(row["start_char"]), end_char=int(row["end_char"]),
-                    occurred_at=str(row["occurred_at"]), speaker=str(row["speaker"]),
-                    text=str(row["anchored_text"]),
-                    matched=any(str(h["span_id"]) == span_id for h in hits),
-                ))
+        for start in range(0, len(top), _SPAN_READ_BATCH):
+            batch = top[start : start + _SPAN_READ_BATCH]
+            by_turn: dict[str, list[sqlite3.Row]] = {e: [] for e in batch}
+            for row in self.store.rows(
+                "SELECT * FROM recall_spans WHERE evidence_id IN "
+                f"({','.join('?' for _ in batch)}) ORDER BY evidence_id,ordinal",  # noqa: S608
+                tuple(batch),
+            ):
+                by_turn[str(row["evidence_id"])].append(row)
+            for evidence_id, rows in by_turn.items():
+                turn_anchors = anchors[evidence_id]
+                rows.sort(key=lambda r: min(abs(int(r["ordinal"]) - a) for a in turn_anchors))
+                used = 0
+                for row in rows:
+                    size = len(str(row["anchored_text"]).encode()) + 12
+                    if used + size <= cap:
+                        used += size
+                        focused.append(_recalled_span(row, matched))
         chosen = {s.span_id for s in focused}
         return focused + [s for s in spans if s.span_id not in chosen]
 
     def _expand(self, hits: list[Any], window: int) -> list[RecalledSpan]:
-        chosen: dict[str, RecalledSpan] = {}
         matched = {str(h["span_id"]) for h in hits}
-        for hit in hits:
+        if len(hits) == 1:
+            hit = hits[0]
+            ordinal = int(hit["ordinal"])
+            rows = self.store.rows(
+                "SELECT * FROM recall_spans WHERE evidence_id=? AND ordinal BETWEEN ? AND ? "
+                "ORDER BY ordinal",
+                (hit["evidence_id"], ordinal - window, ordinal + window),
+            )
+            return [_recalled_span(row, matched) for row in rows]
+        chosen: dict[str, RecalledSpan] = {}
+        for start in range(0, len(hits), _SPAN_READ_BATCH):
+            batch = hits[start : start + _SPAN_READ_BATCH]
+            windows = ",".join(f"({rank},?,?,?)" for rank in range(len(batch)))
+            params: list[Any] = []
+            for hit in batch:
+                ordinal = int(hit["ordinal"])
+                params.extend((hit["evidence_id"], ordinal - window, ordinal + window))
+            # The first hit that covers a span owns its position in the render budget.
+            # Resolve overlapping windows against rowids before fetching any excerpt text.
             for row in self.store.rows(
-                "SELECT * FROM recall_spans WHERE evidence_id=? AND ordinal BETWEEN ? AND ?",
-                (hit["evidence_id"], int(hit["ordinal"]) - window, int(hit["ordinal"]) + window),
+                f"WITH windows(rank,evidence_id,lo,hi) AS (VALUES {windows}), "  # noqa: S608
+                "ranked AS (SELECT s.rowid AS id,min(w.rank) AS rank FROM windows w "
+                "JOIN recall_spans s ON s.evidence_id=w.evidence_id AND s.ordinal BETWEEN w.lo "
+                "AND w.hi GROUP BY s.rowid) SELECT s.* FROM ranked JOIN recall_spans s "
+                "ON s.rowid=ranked.id ORDER BY ranked.rank,s.ordinal",
+                tuple(params),
             ):
                 span_id = str(row["span_id"])
-                chosen.setdefault(
-                    span_id,
-                    RecalledSpan(
-                        span_id=span_id,
-                        evidence_id=str(row["evidence_id"]),
-                        ordinal=int(row["ordinal"]),
-                        start_char=int(row["start_char"]),
-                        end_char=int(row["end_char"]),
-                        occurred_at=str(row["occurred_at"]),
-                        speaker=str(row["speaker"]),
-                        text=str(row["anchored_text"]),
-                        matched=span_id in matched,
-                    ),
-                )
+                if span_id not in chosen:
+                    chosen[span_id] = _recalled_span(row, matched)
         return list(chosen.values())
 
 

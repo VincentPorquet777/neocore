@@ -48,7 +48,7 @@ from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from neocore import __version__
 
@@ -87,7 +87,12 @@ _STAGES = ThreadPoolExecutor(4, thread_name_prefix="neocore-recall")
 _STAGE_SLOTS = threading.BoundedSemaphore(4)
 
 
-def _bounded_stage(call: Callable[[], Any], deadline: RecallDeadline | None) -> Any:
+_StageResult = TypeVar("_StageResult")
+
+
+def _bounded_stage(
+    call: Callable[[], _StageResult], deadline: RecallDeadline | None,
+) -> _StageResult:
     if deadline is None:
         return call()
     deadline.check()
@@ -632,7 +637,6 @@ class DevMemory:
         allowed = set(scopes)
         if not allowed:
             raise PermissionError("recall requires at least one allowed scope")
-        from neocore.assistant import profile as dev_profile
         from neocore.assistant import render as dev_render
         from neocore.assistant import sleep as dev_sleep
         from neocore.assistant.filter import HOP, SOLO_EXTRA
@@ -674,6 +678,7 @@ class DevMemory:
             allowance = RecallDeadline(deadline.end, 0.0) if finalizing and deadline else deadline
             return _bounded_stage(lambda: store_rows(sql, params), allowance)
 
+        context_ids: set[str] = set()
         excluded: list[str] = []
         context: list[dict[str, str]] = []
         if exclude_session:
@@ -683,12 +688,15 @@ class DevMemory:
                 for r in rows("SELECT evidence_id FROM evidence WHERE thread_id=? AND timestamp>=?",
                               (thread, since))
             ]
-            context = [
-                {"speaker": str(r["speaker"]), "text": normalize(str(r["content"])[:20_000]),
-                 "at": str(r["timestamp"] or "")}
-                for r in reversed(rows("SELECT speaker,content,timestamp FROM evidence WHERE "
-                                       "thread_id=? ORDER BY timestamp DESC LIMIT 2", (thread,)))
-            ]
+            if last is None:
+                recent = _bounded_stage(
+                    lambda: self.recall_engine.recent_context(thread, allowed, "", 2), deadline)
+                context_ids = {str(r["evidence_id"]) for r in recent}
+                context = [
+                    {"speaker": str(r["speaker"]), "text": normalize(str(r["content"])[:20_000]),
+                     "at": str(r["timestamp"] or "")}
+                    for r in reversed(recent)
+                ]
         # Whole turns: NeoSift reads the END of the reply before (a follow-up answers its last
         # lines); Jev is sent the first 500 characters of each.
         if last is not None:  # fresher than the store, which catches up on the next sync
@@ -741,7 +749,7 @@ class DevMemory:
                 **pool,
             ), deadline)
             if deadline:  # only a search that finished in time moves the warm caches on
-                for name in ("_span_vectors", "_fact_vectors", "_coverage"):
+                for name in ("_span_vectors", "_fact_vectors", "_span_owners", "_coverage"):
                     if hasattr(engine, name):
                         setattr(self.recall_engine, name, getattr(engine, name))
             return result
@@ -751,6 +759,21 @@ class DevMemory:
         # Sleep's verdicts: a duplicate comes back as its fuller twin; a superseded fact brings
         # the newest fact that replaced it along ("Atlas is on b117" -> "... on b118").
         replaced, duplicates = dev_sleep.replacements(self.home), dev_sleep.hidden(self.home)
+
+        def authorized(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            allowance = RecallDeadline(deadline.end, 0.0) if finalizing and deadline else deadline
+            return _bounded_stage(
+                lambda: self.recall_engine.authorized_items(items, allowed, excluded=excluded),
+                allowance)
+
+        def scorer_context() -> list[dict[str, str]]:
+            if context_ids:
+                visible, _ = _bounded_stage(
+                    lambda: self.recall_engine.authorized_support(list(context_ids), (), allowed),
+                    deadline)
+                if visible != context_ids:
+                    return []
+            return context
 
         def found(result: Any) -> list[dict[str, Any]]:
             fact_ids = list(dict.fromkeys(
@@ -789,13 +812,13 @@ class DevMemory:
             items = [facts[f] for f in fact_ids if f in facts]
             listed = {i["id"] for i in items}
             for evidence_id, spans in excerpts.items():
-                newer = list(dict.fromkeys(f for f in newer_of.get(evidence_id, []) if f in facts))
+                newer = list(dict.fromkeys(newer_of.get(evidence_id, [])))
                 items.append({"kind": "excerpt", "id": evidence_id, "spans": spans,
                               "text": normalize("\n".join(s.text for s in spans)),
                               **({"newer": newer} if newer else {})})
-                items += [facts[f] for f in newer if f not in listed]
+                items += [facts[f] for f in newer if f in facts and f not in listed]
                 listed.update(newer)
-            return items
+            return authorized(items)
 
         def with_newer(chosen: list[dict[str, Any]], pool: list[dict[str, Any]]) -> list[Any]:
             """A replaced item never arrives without what replaced it."""
@@ -861,10 +884,21 @@ class DevMemory:
             lap("solo")
         # A chat's first message gets the user's briefing; the chat then holds it like any
         # memory (until it is compacted).
+        from neocore.assistant import profile as dev_profile
+
         profile_id = dev_render.PROFILE_ID + dev_profile.scope_key(allowed)
+        def read_briefing() -> str:
+            allowance = RecallDeadline(deadline.end, 0.0) if finalizing and deadline else deadline
+            text = _bounded_stage(
+                lambda: dev_profile.get(
+                    self.home, allowed, rows=self.store.rows,
+                    fact_support=self.recall_engine.fact_support),
+                allowance)
+            return normalize(text)
+
         briefing = ""
         if last is None and self.config.get("profile", True) and profile_id not in held:
-            briefing = normalize(dev_profile.get(self.home, allowed))
+            briefing = read_briefing()
         # Scoring stops early enough to finish: given the whole remainder, a slow scorer used it
         # all and the recall then failed its own deadline, delivering nothing.
         scoring: float | None = None
@@ -872,6 +906,8 @@ class DevMemory:
             left = deadline.remaining()
             finish = float(self.config.get("select_finish_seconds", 0.35))
             scoring = min(self.gate.timeout, left - min(finish, left / 4))
+        keep: list[dict[str, Any]] | None
+        record: dict[str, Any]
         if scoring is not None and scoring <= 0:
             if not briefing:
                 raise TimeoutError("recall deadline")
@@ -880,7 +916,7 @@ class DevMemory:
                                 "host": host, "mode": self.gate.mode, "status": "deadline",
                                 "kept": 0}
         else:
-            keep, record = self.gate.select(query, context, items, host, timeout=scoring)
+            keep, record = self.gate.select(query, scorer_context(), items, host, timeout=scoring)
         if (deadline and keep == [] and record.get("status") == "error:TimeoutError"
                 and not briefing):
             raise TimeoutError("recall deadline")
@@ -914,7 +950,7 @@ class DevMemory:
                 pool_items += more
                 lap("hop")
                 if more and keep is not None:
-                    keep = self.gate.extend(query, context, keep, more, record,
+                    keep = self.gate.extend(query, scorer_context(), keep, more, record,
                                             timeout=deadline.remaining() if deadline else None)
                     lap("hop_select")
             except TimeoutError:
@@ -929,6 +965,11 @@ class DevMemory:
         record["bytes"] = len(result.rendered.encode())
         chosen = items if keep is None else keep
         finalizing = True
+        before_check = len(chosen)
+        chosen = authorized(chosen)
+        record["authority_dropped"] = before_check - len(chosen)
+        if briefing and read_briefing() != briefing:
+            briefing = ""
         origin = dev_render.provenance(rows, [i["id"] for i in chosen if i["kind"] == "excerpt"],
                                        [i["id"] for i in chosen if i["kind"] == "fact"])
         # A lesson ("last time this broke because ...") is spent first: it prevents mistakes.
@@ -957,7 +998,7 @@ class DevMemory:
             "host": host, "session": exclude_session, "since": since, "ids": set(shown),
             "hashes": {_short(h) for item in emitted for h in item["span_hashes"]},
             "prompt": query, "items": emitted, "at": str(record["at"]), "owner": owner,
-            "learn": bool(keep) and self.gate.learning != "off", "digest": digest,
+            "scopes": allowed, "learn": bool(keep) and self.gate.learning != "off", "digest": digest,
             "expires": (deadline.end if deadline else time.monotonic() + ASK_SECONDS) + grace,
             "acked": False,
         }
@@ -1012,7 +1053,9 @@ class DevMemory:
 
             # sync asks, once the reply is stored, which of these the reply needed
             dev_outcomes.remember(self.home, host=entry["host"], session=entry["session"],
-                                  prompt=entry["prompt"], items=entry["items"], at=entry["at"])
+                                  prompt=entry["prompt"],
+                                  items=self.recall_engine.authorized_items(
+                                      entry["items"], entry["scopes"]), at=entry["at"])
 
     def _entry(self, host: str, session: str, since: str) -> dict[str, Any]:
         if not session:
@@ -1142,7 +1185,8 @@ class DevMemory:
                     renew()
                     try:
                         receipt["profile"].append(dev_profile.build(
-                            self.store.rows, self.home, _renewing(ask, renew), scopes))
+                            self.store.rows, self.home, _renewing(ask, renew), scopes,
+                            fact_support=self.recall_engine.fact_support))
                     except Exception as error:  # the model may be away; the next sync retries
                         receipt["profile"].append({"error": type(error).__name__})
         return receipt
@@ -2094,8 +2138,9 @@ def main(argv: list[str] | None = None) -> None:
             if ask is None:
                 sys.exit("no model configured: install the Codex or Claude Code CLI, or set llm")
             print(json.dumps(dev_profile.build(memory.store.rows, memory.home, ask, {SCOPE},
-                                               force=True), indent=1))
-        print(dev_profile.get(memory.home, {SCOPE}) or "No briefing yet: the next sync writes "
+                                               force=True, fact_support=memory.recall_engine.fact_support), indent=1))
+        print(dev_profile.get(memory.home, {SCOPE}, rows=memory.store.rows,
+                              fact_support=memory.recall_engine.fact_support) or "No briefing yet: the next sync writes "
               "it from the memory's facts (it needs formed facts and a model).")
     elif args.command == "status" and (remote := _remote_status()) is not None:
         print(json.dumps(remote, indent=1))

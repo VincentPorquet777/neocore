@@ -105,7 +105,8 @@ After setup:
 - **Every prompt** gets the memory that matters, as hook context, in well under a second. A warm
   local daemon serves it. A chat's first prompt also gets your briefing.
 - **Memory tools** for the AI to look further on purpose: `neocore_search`, `neocore_open`,
-  `neocore_timeline`, `neocore_facts`, `neocore_profile` and `neocore_remember`.
+  `neocore_timeline`, `neocore_facts`, `neocore_profile` and `neocore_remember`. Use `kind=turns` on
+  `neocore_search` for the original wording of a decision. The default lists facts first.
 - **Every finished reply** starts a background sync. It reads new turns from Claude Code and
   Codex transcripts (prompts and final replies only; tool output is skipped and obvious secrets
   are redacted) and indexes them.

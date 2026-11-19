@@ -17,8 +17,8 @@ help.
   direct messages from your own ids (`owners`). A group, or anyone else who messages your agent,
   gets a separate memory and never sees yours. Subagents and cron runs read memory but never
   write it.
-- **Verbatim and dated.** Recall shows what was actually said and when. When two items disagree,
-  the newer one holds.
+- **Verbatim and dated.** Recall shows what was actually said and when. Answers can distinguish a supported correction from a later guess,
+  and a historical account from what applies today.
 - **Matches meaning.** A small local embedding model (bge-small) finds paraphrases:
   "Which city do I live in these days?" finds "I moved to Lisbon in May." Word matching (BM25)
   works from the first turn, before the model is downloaded.
