@@ -1,6 +1,6 @@
 {
   "name": "neocore",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "One memory for every AI you use: Claude Code, Codex and Hermes share it. Before each prompt, NeoCore adds the dated excerpts and facts that prompt needs, with zero model calls at recall.",
   "author": {
     "name": "VincentPorquet777",
