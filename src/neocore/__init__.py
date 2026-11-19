@@ -20,7 +20,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 from neocore.recall import GovernedRecall, RecallResult  # noqa: E402
 from neocore.store import Store  # noqa: E402

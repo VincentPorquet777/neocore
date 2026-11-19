@@ -1,0 +1,14 @@
+{
+  "name": "neocore",
+  "owner": {
+    "name": "VincentPorquet777"
+  },
+  "description": "NeoCore: one memory for Claude Code, Codex and Hermes.",
+  "plugins": [
+    {
+      "name": "neocore",
+      "source": "./integrations/claude-code",
+      "description": "One memory for every AI you use: Claude Code, Codex and Hermes share it. Before each prompt, NeoCore adds the dated excerpts and facts that prompt needs, with zero model calls at recall."
+    }
+  ]
+}

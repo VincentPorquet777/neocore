@@ -1,0 +1,20 @@
+{
+  "name": "neocore",
+  "interface": {
+    "displayName": "NeoCore"
+  },
+  "plugins": [
+    {
+      "name": "neocore",
+      "source": {
+        "source": "local",
+        "path": "./integrations/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

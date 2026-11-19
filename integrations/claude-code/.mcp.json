@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "neocore": {
+      "command": "neocore",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

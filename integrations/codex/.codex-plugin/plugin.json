@@ -1,0 +1,36 @@
+{
+  "name": "neocore",
+  "version": "0.3.3",
+  "description": "One memory for every AI you use: Claude Code, Codex and Hermes share it. Before each prompt, NeoCore adds the dated excerpts and facts that prompt needs, with zero model calls at recall.",
+  "author": {
+    "name": "VincentPorquet777",
+    "url": "https://github.com/VincentPorquet777/neocore"
+  },
+  "homepage": "https://github.com/VincentPorquet777/neocore",
+  "repository": "https://github.com/VincentPorquet777/neocore",
+  "license": "Apache-2.0",
+  "keywords": [
+    "memory",
+    "recall",
+    "claude-code",
+    "hermes",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "NeoCore",
+    "shortDescription": "One memory shared by Codex, Claude Code and Hermes",
+    "longDescription": "One memory for every AI you use: Claude Code, Codex and Hermes share it. Before each prompt, NeoCore adds the dated excerpts and facts that prompt needs, with zero model calls at recall. Search, open and remember tools come with it. Everything stays on your machine or your own memory server.",
+    "developerName": "VincentPorquet777",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/VincentPorquet777/neocore",
+    "defaultPrompt": [
+      "What did we decide about this project last week?",
+      "Search my memory for the deploy steps"
+    ]
+  }
+}

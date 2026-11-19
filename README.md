@@ -72,6 +72,34 @@ Codex will ask you to trust the new hooks the first time they run. `neocore unin
 the hooks and keeps your memory. `neocore doctor` checks the install. Run
 `neocore setup --dry-run` to see the plan first.
 
+### Or as a plugin
+
+The same hooks and memory tools also come as a Claude Code plugin and a Codex plugin. Install
+the package first (the plugins run the `neocore` command), then set up the memory folder
+without touching your settings files:
+
+```bash
+pipx install "neocore-memory[embed]"
+neocore setup --no-claude --no-codex
+```
+
+Claude Code:
+
+```
+/plugin marketplace add VincentPorquet777/neocore
+/plugin install neocore@neocore
+```
+
+Codex:
+
+```bash
+codex plugin marketplace add VincentPorquet777/neocore
+codex plugin add neocore@neocore
+```
+
+Pick one way per tool. If `neocore setup` already added its hooks, the plugin's hooks stay quiet,
+so each prompt still gets its memory once.
+
 After setup:
 
 - **Every prompt** gets the memory that matters, as hook context, in well under a second. A warm

@@ -463,6 +463,19 @@ def forget(args: argparse.Namespace) -> None:
     print(f"forgot {len(rows)} messages of {args.conversation}")
 
 
+def _set_up_by_hand(command: str) -> bool:
+    """Whether ``neocore setup`` already put this hook in the host's own settings: the Claude
+    Code and Codex plugins then stay quiet, so a machine set up both ways recalls once."""
+    try:
+        if command.startswith("claude-"):
+            return _has_claude_hooks(memory._read_json(_claude_settings()))
+        if command.startswith("codex-"):
+            return BEGIN in _codex_config().read_text(encoding="utf-8")
+    except OSError:
+        pass
+    return False
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] in (["connect"], ["disconnect"], ["server"]):
@@ -479,6 +492,10 @@ def main(argv: list[str] | None = None) -> None:
         return
     if argv[:1] == ["rules"]:
         sys.exit(rules.manage(argv[1:] or ["-h"], on_change=refresh_rule_hooks))
+    if "--plugin" in argv[1:]:
+        argv = [a for a in argv if a != "--plugin"]
+        if _set_up_by_hand(argv[0]):
+            return  # `neocore setup` installed the same hook; run it once, not twice
     if not argv or argv[0] not in own:
         memory.main(argv)  # hooks, daemon, recall, sync, status, stats ...
         return
