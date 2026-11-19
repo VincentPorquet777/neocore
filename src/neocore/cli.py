@@ -12,6 +12,8 @@
     neocore forget CONVERSATION
     neocore prefs list [--all] | add TOPIC RULE | pin|unpin|reject ID | log   (learnt rules)
     neocore changes [--limit N]     what changed the memory, newest last
+    neocore export DIR              the memory as Markdown notes (opens as an Obsidian vault)
+    neocore backup FILE | restore FILE [--force]   the memory as one file, and back
     neocore undo [RUN | --list]     take one background pass back (``neocore changes``)
     neocore connect --url URL --key-file FILE [--ssh HOST --socket PATH] [--tools-only]
     neocore disconnect
@@ -560,6 +562,31 @@ def changes_command(argv: list[str]) -> None:
         print(f"{row.get('at', '')}  {row.get('what', '')}  {json.dumps(rest, ensure_ascii=False)}")
 
 
+def files_command(command: str, argv: list[str]) -> None:
+    """``neocore export DIR``, ``neocore backup FILE``, ``neocore restore FILE [--force]``."""
+    from neocore.assistant import export
+
+    parser = argparse.ArgumentParser(prog=f"neocore {command}")
+    parser.add_argument("path")
+    if command == "export":
+        parser.add_argument("--scope", default=memory.SCOPE)
+    if command == "restore":
+        parser.add_argument("--force", action="store_true",
+                            help="replace the memory here (its files are moved aside)")
+    args = parser.parse_args(argv)
+    path = Path(args.path).expanduser()
+    try:
+        if command == "export":
+            result: Any = export.markdown(memory.HOME, path, args.scope)
+        elif command == "backup":
+            result = export.backup(memory.HOME, path)
+        else:
+            result = export.restore(memory.HOME, path, force=args.force)
+    except (OSError, ValueError) as error:
+        sys.exit(str(error))
+    print(json.dumps(result, indent=1))
+
+
 def undo_command(argv: list[str]) -> None:
     from neocore.assistant import changes
 
@@ -617,6 +644,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if argv[:1] == ["changes"]:
         changes_command(argv[1:])
+        return
+    if argv[:1] in (["export"], ["backup"], ["restore"]):
+        files_command(argv[0], argv[1:])
         return
     if argv[:1] == ["undo"]:
         undo_command(argv[1:])

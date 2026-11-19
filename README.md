@@ -225,6 +225,25 @@ and it deletes every undo copy with them, since a copy may hold text derived fro
 forgotten. Passes are undone newest first when they changed the same files. The copies cost no
 disk space until a file changes (hard links), and the last 30 passes are kept.
 
+## Read it, keep it: Markdown export and one-file backup
+
+```bash
+neocore export ~/NeoCore-vault     # Markdown notes; open the folder as an Obsidian vault
+neocore backup ~/neocore-2026-11-19.zip
+neocore restore ~/neocore-2026-11-19.zip [--force]
+```
+
+- **Export** writes the briefing, learnt rules, lessons, the current facts by month and one note
+  per conversation; each fact links to the conversations it came from. Withdrawn and forgotten
+  messages, and the facts resting on them, are left out. Exporting again replaces only the
+  notes NeoCore wrote, so notes you add in the same folder stay. The memory itself stays in its
+  database: the export is for reading, searching and keeping.
+- **Backup** is one zip: a consistent copy of the database, taken while your AIs keep working,
+  and the files that hold what the memory knows, each with a SHA-256. Downloaded models, keys
+  and device links are left out. **Restore** checks every hash first, stops NeoCore's own
+  daemon, and moves the files it replaces aside instead of deleting them.
+- A backup is your own file: `neocore forget` cannot reach into backups made before it.
+
 ## NeoSift: the local relevance filter
 
 Recall finds candidates by words and meaning, but many of them only share words with the
