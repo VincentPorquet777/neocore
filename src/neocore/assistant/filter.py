@@ -218,8 +218,8 @@ def error_name(error: BaseException) -> str:
     return f"{type(error).__name__}{code}" if isinstance(code, int) else type(error).__name__
 
 
-def log_record(home: Path, record: dict[str, Any]) -> None:
-    path = home / "recall_log.jsonl"
+def log_record(home: Path, record: dict[str, Any], name: str = "recall_log.jsonl") -> None:
+    path = home / name
     try:
         if path.exists() and path.stat().st_size > LOG_BYTES:
             path.replace(path.with_suffix(".jsonl.1"))

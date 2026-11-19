@@ -1040,7 +1040,12 @@ class DevMemory:
             if time.monotonic() >= entry["expires"]:
                 return False
             self._commit(entry)
-            return True
+        # What reached a chat, for ``stats``: recall tokens count only delivered text.
+        from neocore.assistant.filter import log_record
+
+        log_record(self.home, {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                               "request_id": request_id}, "deliveries.jsonl")
+        return True
 
     def _commit(self, entry: dict[str, Any]) -> None:
         """One delivery reached its chat: it holds the ids and lines shown, and (filter mode)
@@ -2098,12 +2103,14 @@ def main(argv: list[str] | None = None) -> None:
         sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]  # Windows console
         print(DevMemory().recall(args.query))
     elif args.command == "stats":
+        from neocore.assistant import cost as dev_cost
         from neocore.assistant import outcomes as dev_outcomes
         from neocore.assistant.filter import stats
 
         config = _read_json(HOME / "config.json")
         print(json.dumps({**stats(HOME, args.days, config),
-                          "outcomes": dev_outcomes.stats(HOME, args.days)}, indent=1))
+                          "outcomes": dev_outcomes.stats(HOME, args.days),
+                          "prompt_cost": dev_cost.stats(HOME, args.days)}, indent=1))
     elif args.command == "reopen-history":
         # Once, after an upgrade that adds a verdict: history facts with newer neighbours are
         # judged again, ``--calls`` now and the rest by the nightly sleeps.
