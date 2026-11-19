@@ -30,6 +30,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from neocore.llm import child_env
+
 NAME = "neosift-32m-r10"
 MODEL_URL = ("https://github.com/VincentPorquet777/neocore/releases/download/"
              f"{NAME}/{NAME}.zip")
@@ -161,7 +163,7 @@ def ensure(home: Path, port: int = PORT) -> None:
     with (sift / "server.log").open("ab") as log:  # the server keeps its own copy
         subprocess.Popen([str(_python(sift / "venv")), str(sift / "server.py"), "serve",
                           "--port", str(port)], cwd=sift, stdin=subprocess.DEVNULL, stdout=log,
-                         stderr=log, **flags)
+                         stderr=log, env=child_env(), **flags)
 
 
 # -- install ---------------------------------------------------------------------------------
@@ -177,14 +179,19 @@ def _sha256(path: Path) -> str:
 
 def _run(command: list[str]) -> None:
     print("  $ " + " ".join(command), flush=True)
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=child_env())
+
+
+# Bounded so a future major release cannot change what NeoSift runs on (the CUDA wheels make an
+# exact torch pin fragile across graphics cards).
+TORCH, TRANSFORMERS, SAFETENSORS = "torch>=2.4,<3", "transformers>=4.48,<5", "safetensors>=0.4,<1"
 
 
 def torch_install(device: str) -> list[str]:
     """pip arguments for a torch that can use ``device``."""
     if device == "cuda" and sys.platform != "darwin":
-        return ["torch", "--index-url", "https://download.pytorch.org/whl/cu128"]
-    return ["torch"]
+        return [TORCH, "--index-url", "https://download.pytorch.org/whl/cu128"]
+    return [TORCH]
 
 
 def plan(device: str) -> list[str]:
@@ -210,7 +217,7 @@ def install(home: Path, *, force: bool = False, opener: Any = None) -> dict[str,
     python = str(_python(venv))
     _run([python, "-m", "pip", "install", "--upgrade", "pip"])
     _run([python, "-m", "pip", "install", *torch_install(device)])
-    _run([python, "-m", "pip", "install", "transformers>=4.48", "safetensors>=0.4"])
+    _run([python, "-m", "pip", "install", TRANSFORMERS, SAFETENSORS])
     model = sift / "model"
     info = model / "neosift.json"
     if not (info.exists() and json.loads(info.read_text(encoding="utf-8")).get("name") == NAME):
@@ -234,7 +241,7 @@ def install(home: Path, *, force: bool = False, opener: Any = None) -> dict[str,
     # that crashes or refuses means NeoSift cannot run here, so its 2-3 GB go.
     try:
         out = subprocess.run([python, str(sift / "server.py"), "bench"], capture_output=True,
-                             text=True, check=True, cwd=sift)
+                             text=True, check=True, cwd=sift, env=child_env())
         bench = json.loads(out.stdout.strip().splitlines()[-1])
         seconds = float(bench["seconds"])
         print(f"  NeoSift on {bench['device']}: {seconds:.2f} s per 48-memory prompt")

@@ -1653,11 +1653,15 @@ def _background_python() -> str:
 
 
 def _detached(*args: str) -> None:
+    from neocore import llm
+
     flags = _NO_WINDOW | 0x00000200 if os.name == "nt" else 0  # NO_WINDOW | NEW_PROCESS_GROUP
     subprocess.Popen(  # noqa: S603
         [_background_python(), "-m", "neocore.assistant.memory", *args],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=flags, start_new_session=os.name != "nt",
+        # Only the API key the configured backend needs; never the host's other keys.
+        env=llm.child_env(*llm.key_envs(_read_json(HOME / "config.json"))),
     )
 
 

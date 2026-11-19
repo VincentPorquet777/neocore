@@ -26,7 +26,52 @@ from typing import Any, Callable
 Ask = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-_QUIET = {**os.environ, "NEOCORE_DISABLED": "1"}  # our own hooks stay out of these calls
+# What a program NeoCore starts may see of this process's environment: where things live, the
+# locale, temp folders, proxies and certificates. Never API keys or tokens: a host such as Hermes
+# loads every provider key into its environment, and ``claude -p`` with ANTHROPIC_API_KEY set
+# bills that key instead of the user's subscription.
+_PASS = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "OS",
+    "NUMBER_OF_PROCESSORS", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME", "USER",
+    "LOGNAME", "SHELL", "TERM", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "ALLUSERSPROFILE",
+    "PUBLIC", "TEMP", "TMP", "TMPDIR", "LANG", "LANGUAGE", "TZ", "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_GIT_BASH_PATH", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+    "PYTHONIOENCODING", "PYTHONUTF8", "LD_LIBRARY_PATH", "HF_HOME", "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE", "TORCH_HOME", "PYTORCH_CUDA_ALLOC_CONF", "NVIDIA_VISIBLE_DEVICES",
+})
+_PASS_PREFIXES = ("LC_", "XDG_", "NEOCORE_", "CUDA_", "PROGRAMFILES", "COMMONPROGRAMFILES",
+                  "PROCESSOR_")
+_SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE)
+
+
+def child_env(*keep: str, **extra: str) -> dict[str, str]:
+    """A minimal environment for a program NeoCore starts. ``keep`` names variables to pass as
+    they are even when they hold a secret (the ``openai`` backend's own ``llm_key_env``);
+    ``extra`` sets values."""
+    env = {name: value for name, value in os.environ.items()
+           if (name.upper() in _PASS or name.upper().startswith(_PASS_PREFIXES))
+           and not _SECRET.search(name)}
+    env.update({name: os.environ[name] for name in keep if name and name in os.environ})
+    env.update(extra)
+    return env
+
+
+def key_envs(config: dict[str, Any]) -> list[str]:
+    """The variables holding API keys this config itself uses: the ``openai`` backend's
+    ``llm_key_env``, and OpenRouter's for the hosted relevance filter without a key file."""
+    names = []
+    if str(config.get("llm") or "") == "openai":
+        names.append(str(config.get("llm_key_env") or "OPENAI_API_KEY"))
+    if (str(config.get("relevance") or "off") != "off"
+            and str(config.get("relevance_scorer") or "jev") == "jev"
+            and not config.get("relevance_key_file")):
+        names.append("OPENROUTER_API_KEY")
+    return names
+
+
+def _quiet() -> dict[str, str]:
+    return child_env(NEOCORE_DISABLED="1")  # our own hooks stay out of these calls
 
 
 def find_codex() -> str | None:
@@ -86,7 +131,7 @@ def codex(executable: str, model: str = "", effort: str = "low") -> Ask:
                 command[2:2] = ["--model", model]
             subprocess.run(  # noqa: S603
                 command, input=prompt, cwd=temp, capture_output=True, text=True,
-                encoding="utf-8", timeout=600, check=True, env=_QUIET, creationflags=_NO_WINDOW)
+                encoding="utf-8", timeout=600, check=True, env=_quiet(), creationflags=_NO_WINDOW)
             return dict(json.loads(answer.read_text(encoding="utf-8")))
 
     return ask
@@ -108,7 +153,7 @@ def claude(executable: str, model: str = "haiku") -> Ask:
                 input=f"{prompt}\n\nReply with JSON only, matching this JSON Schema:\n"
                       f"{json.dumps(schema)}",
                 cwd=temp, capture_output=True, text=True, encoding="utf-8", timeout=600,
-                check=True, env=_QUIET, creationflags=_NO_WINDOW)
+                check=True, env=_quiet(), creationflags=_NO_WINDOW)
         return _json_in(completed.stdout)
 
     return ask
