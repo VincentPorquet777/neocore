@@ -14,11 +14,12 @@ them on the next sync. ``"profile": false`` in ``config.json`` turns briefings o
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,7 @@ SCHEMA = {
 }
 
 Rows = Callable[..., Iterable[Any]]
+FactSupport = Callable[[Sequence[str], set[str]], dict[str, tuple[str, ...]]]
 Ask = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 
@@ -77,14 +79,82 @@ def _write(home: Path, state: dict[str, Any]) -> None:
     os.replace(temp, home / FILE)
 
 
-def get(home: Path, scopes: Iterable[str]) -> str:
-    """The briefing for exactly this scope set, or "" while none is built."""
-    entry = _read(home).get(scope_key(scopes)) or {}
-    return str(entry.get("text") or "") if isinstance(entry, dict) else ""
+def _digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _bound_inputs(
+    rows: Rows, home: Path, scopes: list[str], ids: list[str], fact_support: FactSupport,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Bind the exact prompt lines to all of their currently readable, immutable sources."""
+    from neocore.assistant import render as dev_render
+    from neocore.assistant import sleep as dev_sleep
+
+    hidden = dev_sleep.hidden(home)
+    replaced = dev_sleep.replacements(home)
+    candidates = [key for key in ids if key not in hidden and key not in replaced]
+    support = fact_support(candidates, set(scopes)) if candidates else {}
+    if not support:
+        return [], []
+    # The origin shown to the writer belongs to the newest cited source itself. Another turn
+    # in the same thread may have different project metadata or a narrower scope.
+    joined = rows(
+        "SELECT f.fact_id,f.text,f.occurred_at,e.evidence_id,e.source_hash,"
+        "e.timestamp,e.thread_id,e.metadata_json "
+        "FROM recall_facts f JOIN recall_fact_sources fs ON fs.fact_id=f.fact_id "
+        "JOIN evidence e ON e.evidence_id=fs.evidence_id "
+        "WHERE f.fact_id IN (SELECT value FROM json_each(?)) ORDER BY f.fact_id,e.evidence_id",
+        (json.dumps(list(support)),),
+    )
+    sources: dict[str, list[Any]] = {}
+    for row in joined:
+        sources.setdefault(str(row["fact_id"]), []).append(row)
+    inputs: list[dict[str, Any]] = []
+    lines: list[str] = []
+    for key in candidates:
+        group = sources.get(key, [])
+        source_ids = tuple(str(row["evidence_id"]) for row in group)
+        if not source_ids or source_ids != support.get(key):
+            continue
+        newest = max(group, key=lambda row: (str(row["timestamp"]), str(row["evidence_id"])))
+        project = dev_render.metadata_project(newest["metadata_json"])
+        host = str(newest["thread_id"] or "").split(":", 1)[0]
+        origin = dev_render.HOSTS.get(host, host)
+        day = str(newest["occurred_at"])[:10]
+        content = " ".join(str(newest["text"]).split())
+        line = f"- {day} ({origin}, {project}): {content}"
+        lines.append(line)
+        inputs.append({
+            "fact_id": key, "sources": list(source_ids),
+            "input_sha256": _digest([line, [str(row["source_hash"]) for row in group]]),
+        })
+    return inputs, lines
+
+
+def get(home: Path, scopes: Iterable[str], *, rows: Rows, fact_support: FactSupport) -> str:
+    """Return a briefing only while its exact inputs remain current for this scope set."""
+    ordered = sorted(set(scopes))
+    entry = _read(home).get(scope_key(ordered))
+    if not ordered or not isinstance(entry, dict) or entry.get("scopes") != ordered:
+        return ""
+    text = entry.get("text")
+    inputs = entry.get("inputs")
+    if not isinstance(text, str) or not text:
+        return ""
+    if not isinstance(inputs, list) or not 0 < len(inputs) <= FACTS + LESSONS:
+        return ""
+    if entry.get("binding_sha256") != _digest([ordered, inputs, text]):
+        return ""
+    if not all(isinstance(item, dict) and isinstance(item.get("fact_id"), str) for item in inputs):
+        return ""
+    ids = [item["fact_id"] for item in inputs]
+    current, _ = _bound_inputs(rows, home, ordered, ids, fact_support)
+    return text if current == inputs else ""
 
 
 def readable_facts(rows: Rows, scopes: Iterable[str], hidden: set[str], replaced: dict[str, str],
-                   limit: int) -> list[Any]:
+                   limit: int, fact_support: FactSupport) -> list[Any]:
     """The newest current facts every source of which ``scopes`` may read (none withdrawn)."""
     from neocore.assistant.render import unreadable_source
 
@@ -93,12 +163,22 @@ def readable_facts(rows: Rows, scopes: Iterable[str], hidden: set[str], replaced
         return []
     marks = ",".join("?" * len(ordered))
     found = rows(
-        "SELECT fact_id,text,occurred_at FROM recall_facts f WHERE EXISTS ("
+        "SELECT fact_id FROM recall_facts f WHERE EXISTS ("
         "SELECT 1 FROM recall_fact_sources s WHERE s.fact_id=f.fact_id) AND NOT "
         + unreadable_source(marks, "f.fact_id") + " ORDER BY occurred_at DESC LIMIT ?",
         (*ordered, limit * 3))
-    return [r for r in found
-            if str(r["fact_id"]) not in hidden and str(r["fact_id"]) not in replaced][:limit]
+    candidates = [str(r["fact_id"]) for r in found
+                  if r["fact_id"] not in hidden and r["fact_id"] not in replaced]
+    support = fact_support(candidates, set(ordered)) if candidates else {}
+    wanted = [key for key in candidates if key in support][:limit]
+    if not wanted:
+        return []
+    # Fetch fact text only after canonical branch, revision and access validation.
+    facts = {str(r["fact_id"]): r for r in rows(
+        "SELECT fact_id,text,occurred_at FROM recall_facts "
+        "WHERE fact_id IN (SELECT value FROM json_each(?))", (json.dumps(wanted),),
+    )}
+    return [facts[key] for key in wanted if key in facts]
 
 
 def due(home: Path, scopes: Iterable[str], newest: str, now: float | None = None) -> bool:
@@ -106,12 +186,16 @@ def due(home: Path, scopes: Iterable[str], newest: str, now: float | None = None
     entry = _read(home).get(scope_key(scopes)) or {}
     if not isinstance(entry, dict) or not entry.get("text"):
         return True
-    age = ((time.time() if now is None else now) - float(entry.get("built") or 0)) / 3600
+    try:
+        built = float(entry.get("built") or 0)
+    except (TypeError, ValueError):
+        return True
+    age = ((time.time() if now is None else now) - built) / 3600
     return age >= FRESH_HOURS or (newest > str(entry.get("newest") or "") and age >= NEWS_HOURS)
 
 
 def build(rows: Rows, home: Path, ask: Ask, scopes: Iterable[str], *,
-          force: bool = False) -> dict[str, Any]:
+          fact_support: FactSupport, force: bool = False) -> dict[str, Any]:
     """Rebuild the briefing for ``scopes`` when it is due (one model call). A short receipt."""
     from neocore.assistant import render as dev_render
     from neocore.assistant import sleep as dev_sleep
@@ -119,37 +203,39 @@ def build(rows: Rows, home: Path, ask: Ask, scopes: Iterable[str], *,
 
     scopes = sorted(set(scopes))
     hidden, replaced = dev_sleep.hidden(home), dev_sleep.replacements(home)
-    facts = readable_facts(rows, scopes, hidden, replaced, FACTS)
+    facts = readable_facts(rows, scopes, hidden, replaced, FACTS, fact_support)
     if not facts:
         return {"scopes": scope_key(scopes), "skipped": "no facts"}
     newest = str(facts[0]["occurred_at"])
-    if not force and not due(home, scopes, newest):
+    if not force and not due(home, scopes, newest) and get(
+        home, scopes, rows=rows, fact_support=fact_support,
+    ):
         return {"scopes": scope_key(scopes), "skipped": "fresh"}
     # Lessons say how to work with this user; older ones still hold, so they join the newest facts.
     seen = {str(f["fact_id"]) for f in facts}
-    lessons = [f for f in readable_facts(rows, scopes, hidden, replaced, FACTS * 4)
+    lessons = [f for f in readable_facts(rows, scopes, hidden, replaced, FACTS * 4, fact_support)
                if str(f["fact_id"]) not in seen
                and dev_render.is_lesson({"kind": "fact", "text": str(f["text"])})][:LESSONS]
     chosen = facts + lessons
-    # Where each fact was learnt (assistant, project), so a rule stays scoped to where it applies.
-    origin = dev_render.provenance(rows, [], [str(f["fact_id"]) for f in chosen])
-
-    def where(fact: Any) -> str:
-        found = origin.get(str(fact["fact_id"]))
-        return f" ({dev_render.HOSTS.get(found[0], found[0])}, {found[1]})" if found else ""
-
-    lines = "\n".join(
-        f"- {str(f['occurred_at'])[:10]}{where(f)}: {' '.join(str(f['text']).split())}"
-        for f in chosen)
-    answer = ask(PROMPT.format(limit=PROFILE_CHARACTERS) + lines, SCHEMA)
+    ids = [str(f["fact_id"]) for f in chosen]
+    inputs, lines = _bound_inputs(rows, home, scopes, ids, fact_support)
+    if not inputs:
+        return {"scopes": scope_key(scopes), "skipped": "no facts"}
+    answer = ask(PROMPT.format(limit=PROFILE_CHARACTERS) + "\n".join(lines), SCHEMA)
     text = str((answer or {}).get("profile") or "").strip()
     if not text:
         return {"scopes": scope_key(scopes), "error": "empty answer"}
     text = redact(text)[: PROFILE_CHARACTERS + 200]
+    # The model may have been running while a source was corrected or withdrawn.
+    bound_ids = [item["fact_id"] for item in inputs]
+    current, _ = _bound_inputs(rows, home, scopes, bound_ids, fact_support)
+    if current != inputs:
+        return {"scopes": scope_key(scopes), "skipped": "inputs changed"}
     state = _read(home)
     state[scope_key(scopes)] = {
-        "text": text, "built": time.time(), "newest": newest, "facts": len(chosen),
+        "scopes": scopes, "inputs": inputs, "binding_sha256": _digest([scopes, inputs, text]),
+        "text": text, "built": time.time(), "newest": newest, "facts": len(inputs),
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     _write(home, state)
-    return {"scopes": scope_key(scopes), "built": len(text), "facts": len(chosen)}
+    return {"scopes": scope_key(scopes), "built": len(text), "facts": len(inputs)}

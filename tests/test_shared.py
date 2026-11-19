@@ -481,8 +481,13 @@ def test_a_server_briefs_each_key_from_its_own_scopes(rig: Rig) -> None:
     key, al = rig.issue(), rig.issue("al-pc", ("al",), "al")
     rig.capture(key, _turn("s1", "t1", "Which port does the zebra gateway use?",
                            "The zebra gateway listens on port 8791."))
-    (rig.home / "profile.json").write_text(json.dumps({"internal": {
-        "text": "Alex runs the zebra gateway.", "built": time.time()}}), encoding="utf-8")
+    from neocore.assistant import profile
+    engine = rig.service.writer.recall_engine
+    source = rig.evidence()[0]["evidence_id"]
+    assert engine.add_fact("Alex runs the zebra gateway.", [source], former="fixture")
+    assert profile.build(rig.service.memory.store.rows, rig.home,
+                         lambda *_: {"profile": "Alex runs the zebra gateway."}, {"internal"},
+                         fact_support=engine.fact_support)["built"]
     status, listed = rig.call(key, "POST", "/mcp",
                               {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert listed["result"]["tools"][0]["name"] == "neocore_profile"
@@ -507,3 +512,19 @@ def test_the_server_sync_briefs_every_scope_set_in_use(rig: Rig) -> None:
     gone, _ = rig.service.keys.issue("d", "alex", read_scopes=("old",), write_scope="old")
     rig.service.keys.revoke(gone)
     assert background.profile_scopes() == [frozenset({"al"}), frozenset({"al", "bea"})]
+
+
+def test_project_provenance_is_bound_to_exact_turn_even_in_one_conversation(rig: Rig) -> None:
+    reader = rig.issue("reader", ("shared",), "shared")
+    # A device may change working directory in an existing conversation.
+    for n, projects in enumerate((("airfield", "dock"), ("dock", "airfield"))):
+        for pos, project in enumerate(projects):
+            body = f"Windsock stored in hangar {n}." if project == "airfield" else "Dock notes."
+            rig.capture(reader, _turn(f"moving-{n}", str(pos), body, "Recorded.",
+                                      project=f"C:/work/{project}", at=f"2026-10-04T10:0{pos}:00Z"))
+    packet, failed = rig.tool(reader, "neocore_search", query="windsock hangar", kind="turns")
+    hits = [line for line in packet.splitlines() if "windsock" in line.lower()]
+    assert not failed and len(hits) == 2
+    assert all("airfield" in line for line in hits)
+    wrong, failed = rig.tool(reader, "neocore_search", query="windsock hangar", project="dock")
+    assert not failed and "windsock" not in wrong.lower()

@@ -1553,8 +1553,9 @@ def test_the_briefing_is_built_in_the_sync_and_only_when_due(
 
     memory, asked = _one_fact_memory(tmp_path, monkeypatch)
     home = tmp_path / "dev"
-    assert dev_profile.get(home, {"internal"}) == "Alex runs Acme CRM and its Xero sync."
-    assert dev_profile.get(home, {"internal", "other"}) == ""  # one briefing per scope set
+    auth = {"rows": memory.store.rows, "fact_support": memory.recall_engine.fact_support}
+    assert dev_profile.get(home, {"internal"}, **auth) == "Alex runs Acme CRM and its Xero sync."
+    assert dev_profile.get(home, {"internal", "other"}, **auth) == ""  # one briefing per scope set
     briefings = sum("briefing" in p for p in asked)
     assert briefings == 1 and "Acme CRM Xero sync" in asked[-1]
     memory.maintain()  # fresh: no model call
@@ -1565,7 +1566,8 @@ def test_the_briefing_is_built_in_the_sync_and_only_when_due(
     assert dev_profile.due(home, {"internal"}, "", now=time.time() + 21 * 3600)
     # A scope that may read none of the facts gets no briefing, and costs no call.
     rows = memory.store.rows
-    assert dev_profile.build(rows, home, lambda p, s: {"profile": "x"}, {"other"}) == {
+    assert dev_profile.build(rows, home, lambda p, s: {"profile": "x"}, {"other"},
+                             fact_support=memory.recall_engine.fact_support) == {
         "scopes": "other", "skipped": "no facts"}
 
 
@@ -1594,7 +1596,8 @@ def test_a_briefing_can_be_turned_off(tmp_path: Path, monkeypatch: pytest.Monkey
 
     memory, asked = _one_fact_memory(tmp_path, monkeypatch, {"profile": False})
     assert not any("briefing" in p for p in asked)
-    assert dev_profile.get(tmp_path / "dev", {"internal"}) == ""
+    assert dev_profile.get(tmp_path / "dev", {"internal"}, rows=memory.store.rows,
+                           fact_support=memory.recall_engine.fact_support) == ""
     assert "About the user" not in memory.recall("when does the Xero sync run?",
                                                  exclude_session="s9", host="claude-code")
 

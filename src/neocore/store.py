@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS evidence_access (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS evidence_access_evidence ON evidence_access(evidence_id, created_at);
+CREATE TABLE IF NOT EXISTS forgotten_revisions (
+    family_key BLOB NOT NULL CHECK(typeof(family_key)='blob' AND length(family_key)=33),
+    revision TEXT NOT NULL,
+    PRIMARY KEY(family_key,revision)
+) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS evidence_no_recapture BEFORE INSERT ON evidence
+WHEN EXISTS (SELECT 1 FROM evidence_access WHERE evidence_id=new.evidence_id AND state='forgotten')
+BEGIN
+    SELECT RAISE(IGNORE);
+END;
 CREATE TABLE IF NOT EXISTS branch_status (
     disposition_id TEXT PRIMARY KEY,
     branch_id TEXT NOT NULL,
@@ -83,6 +93,35 @@ def _now() -> str:
 
 def _id(prefix: str, *parts: str) -> str:
     return prefix + hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:20]
+
+
+def revision_thread_bucket(thread: str) -> int:
+    """A coarse partition lets recall skip unrelated threads after an erasure."""
+    return hashlib.sha256(thread.encode()).digest()[0]
+
+
+def revision_family_key(family: tuple[str, str, str, str]) -> bytes:
+    """One bucket byte followed by the SHA-256 digest of the complete revision identity."""
+    bucket = bytes([revision_thread_bucket(family[0])])
+    return bucket + hashlib.sha256(json.dumps(family, separators=(",", ":")).encode()).digest()
+
+
+def _record_access(
+    db: sqlite3.Connection, evidence_id: str, state: str, reason: str, by: str
+) -> None:
+    at = _now()
+    cursor = db.execute(
+        "INSERT INTO evidence_access(disposition_id,evidence_id,state,tombstone_hash,"
+        "reason,authorized_by,created_at) SELECT ?,?,?,CASE WHEN ?='forgotten' THEN "
+        "(SELECT source_hash FROM evidence WHERE evidence_id=?) END,?,?,? "
+        "WHERE CASE WHEN ?='forgotten' THEN (SELECT state FROM evidence_access WHERE evidence_id=? "
+        "ORDER BY created_at DESC,disposition_id DESC LIMIT 1) IS NOT 'forgotten' "
+        "ELSE NOT EXISTS (SELECT 1 FROM evidence_access WHERE evidence_id=? AND state='forgotten') END",
+        (_id("access_", evidence_id, state, at), evidence_id, state, state, evidence_id,
+         reason, by, at, state, evidence_id, evidence_id),
+    )
+    if state == "active" and not cursor.rowcount:
+        raise ValueError("forgotten evidence cannot be restored")
 
 
 class Store:
@@ -112,9 +151,36 @@ class Store:
                 self._connection.rollback()
                 raise
 
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """One short consistent read for authority checks. Never held across a scorer call."""
+        with self._lock:
+            connection = self._connection
+            own = not connection.in_transaction
+            if own:
+                connection.execute("BEGIN")
+            try:
+                yield
+            finally:
+                if own:
+                    connection.rollback()
+
     def rows(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
             return list(self._connection.execute(sql, tuple(params)).fetchall())
+
+    def read_version(self) -> tuple[int, int, int] | None:
+        """Stamp for reusable index metadata on this connection only.
+
+        SQLite's data_version observes other connections; total_changes observes this one.
+        DDL need not touch rows. Never publish data read inside an unfinished transaction.
+        """
+        with self._lock:
+            db = self._connection
+            if db.in_transaction:
+                return None
+            return (db.total_changes, db.execute("PRAGMA main.data_version").fetchone()[0],
+                    db.execute("PRAGMA main.schema_version").fetchone()[0])
 
     def close(self) -> None:
         with self._lock:
@@ -189,38 +255,44 @@ class Store:
 
     def revoke(self, evidence_id: str, *, reason: str, by: str = "user") -> None:
         """Stop ``evidence_id`` (and every fact formed from it) from being recalled."""
-        self._dispose(evidence_id, "revoked", reason, by)
+        with self.connection() as db:
+            _record_access(db, evidence_id, "revoked", reason, by)
 
     def restore(self, evidence_id: str, *, reason: str, by: str = "user") -> None:
         """Undo a revoke. Forgotten evidence cannot be restored: its text is gone."""
-        if self.state(evidence_id) == "forgotten":
-            raise ValueError("forgotten evidence cannot be restored")
-        self._dispose(evidence_id, "active", reason, by)
+        with self.connection() as db:
+            _record_access(db, evidence_id, "active", reason, by)
 
     def forget(self, evidence_id: str, *, reason: str, by: str = "user") -> None:
         """Delete the text for good, keeping an audit tombstone (its hash, when and why)."""
-        row = self.rows("SELECT source_hash FROM evidence WHERE evidence_id=?", (evidence_id,))
-        tombstone = str(row[0]["source_hash"]) if row else None
-        self._dispose(evidence_id, "forgotten", reason, by, tombstone)
-        with self.connection() as connection:  # rows are never updated, but may be deleted
-            connection.execute("DELETE FROM evidence WHERE evidence_id=?", (evidence_id,))
+        with self.connection() as db:
+            # Timestamp the terminal disposition after earlier writers have finished.
+            if not db.in_transaction:
+                db.execute("BEGIN IMMEDIATE")
+            _record_access(db, evidence_id, "forgotten", reason, by)
+            row = db.execute(
+                "SELECT thread_id,json_extract(metadata_json,'$.conversation_branch_id'),"
+                "json_extract(metadata_json,'$.turn_id'),json_extract(metadata_json,'$.experience_role'),"
+                "json_extract(metadata_json,'$.turn_revision_id') FROM evidence "
+                "WHERE evidence_id=? AND source_type='conversation' AND json_valid(metadata_json)",
+                (evidence_id,),
+            ).fetchone()
+            if row is not None:
+                thread, branch, turn, role, revision = row
+                family = (
+                    str(thread or ""), str(branch or ""), str(turn or evidence_id), str(role or "")
+                )
+                db.execute(
+                    "INSERT OR IGNORE INTO forgotten_revisions(family_key,revision) VALUES(?,?)",
+                    (revision_family_key(family), "" if revision is None else str(revision)),
+                )
+            db.execute("DELETE FROM evidence WHERE evidence_id=?", (evidence_id,))
 
     def state(self, evidence_id: str) -> str:
         found = self.rows(
             "SELECT state FROM evidence_access WHERE evidence_id=? "
             "ORDER BY created_at DESC,disposition_id DESC LIMIT 1", (evidence_id,))
         return str(found[0]["state"]) if found else "active"
-
-    def _dispose(self, evidence_id: str, state: str, reason: str, by: str,
-                 tombstone: str | None = None) -> None:
-        at = _now()
-        with self.connection() as connection:
-            connection.execute(
-                "INSERT INTO evidence_access(disposition_id,evidence_id,state,tombstone_hash,"
-                "reason,authorized_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (_id("access_", evidence_id, state, at), evidence_id, state, tombstone, reason,
-                 by, at),
-            )
 
     def abandon_branch(self, branch_id: str, *, reason: str,
                        replacement: str | None = None) -> None:

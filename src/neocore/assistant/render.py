@@ -14,6 +14,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import replace
+from functools import cache
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -22,12 +23,17 @@ from neocore.recall import _SPEAKER_PREFIX, _WORD, _parse_time
 # -- repairing and comparing text ---------------------------------------------------------------
 
 
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
 def normalize_request(text: str) -> tuple[str, int]:
     """``text`` with broken characters repaired, and how many were replaced. A lone UTF-16
     surrogate (half of a pasted emoji, a console quirk) cannot be encoded as UTF-8: it broke the
     JSON sent to a scorer or a memory server, and the prompt lost its memory. Paired surrogates
     are joined, lone ones become U+FFFD. Only text derived for recall is repaired; what was
     captured stays as it was."""
+    if not _SURROGATE.search(text):
+        return text, 0
     count = 0
     out: list[str] = []
     index = 0
@@ -66,26 +72,33 @@ _PROTECTED = re.compile(
 )
 
 
-def novelty(text: str, resident: Iterable[str]) -> tuple[bool, float]:
-    """``(exact, overlap)``: whether ``text`` is already, word for word, inside one of the
-    ``resident`` texts (the prompt, the chat's last turn, lines already in this packet), and how
-    much of it the closest one covers (5-word shingles). Only an exact copy is ever dropped; the
-    overlap is only logged. A copy whose numbers or negations differ is not a copy."""
+def _shingles(key: str) -> set[tuple[str, ...]]:
+    words = re.findall(r"\w+", key)
+    return {tuple(words[i : i + 5]) for i in range(len(words) - 4)}
+
+
+def _features(text: str) -> tuple[str, list[str], set[tuple[str, ...]]]:
+    key = copy_key(text).casefold()
+    return key, _PROTECTED.findall(key), _shingles(key)
+
+
+def novelty(text: str, resident: Iterable[str], *,
+            prepare: Callable[[str], tuple[str, list[str], set[tuple[str, ...]]]] = _features,
+            ) -> tuple[bool, float]:
+    """Exact copies are withheld. Five-word overlap is diagnostic only."""
     candidate = copy_key(text).casefold()
     if not candidate:
         return False, 0.0
-    words = re.findall(r"\w+", candidate)
-    shingles = {tuple(words[i : i + 5]) for i in range(len(words) - 4)}
+    shingles = _shingles(candidate)
     signature = _PROTECTED.findall(candidate)
     overlap = 0.0
     for source in resident:
-        key = copy_key(source).casefold()
-        # Word boundaries: "allowed" is not inside "disallowed".
-        match = re.search(r"(?<!\w)" + re.escape(candidate) + r"(?!\w)", key)
-        if candidate == key or (match and signature == _PROTECTED.findall(key)):
+        key, protected, covered = prepare(source)
+        if candidate == key:
             return True, 1.0
-        other = re.findall(r"\w+", key)
-        covered = {tuple(other[i : i + 5]) for i in range(len(other) - 4)}
+        if candidate in key and signature == protected:
+            if re.search(r"(?<!\w)" + re.escape(candidate) + r"(?!\w)", key):
+                return True, 1.0
         if shingles:
             overlap = max(overlap, len(shingles & covered) / len(shingles))
     return False, overlap
@@ -96,10 +109,12 @@ def novel_items(
 ) -> list[dict[str, Any]]:
     """``items`` without the facts and excerpt lines the chat already shows word for word
     (``resident``), before they are scored. Near copies are only noted in ``shadow``."""
+    # The same prompt and previous turn are compared against every candidate in this call.
+    prepare = cache(_features)
     result = []
     for item in items:
         if item["kind"] == "fact":
-            exact, overlap = novelty(item["text"], resident)
+            exact, overlap = novelty(item["text"], resident, prepare=prepare)
             if overlap >= 0.8:
                 shadow.append({"id": item["id"], "exact": exact, "containment": overlap})
             if not exact:
@@ -108,7 +123,7 @@ def novel_items(
         spans = []
         for span in item["spans"]:
             text = normalize_request(span.text)[0]
-            exact, overlap = novelty(text, resident)
+            exact, overlap = novelty(text, resident, prepare=prepare)
             if overlap >= 0.8:
                 shadow.append({"id": item["id"], "hash": span_hash(text), "exact": exact,
                                "containment": overlap})
@@ -125,11 +140,10 @@ HOSTS = {"claude-code": "Claude Code", "codex": "Codex", "hermes": "Hermes", "no
 ASSISTANTS = {"claude-code": "Claude", "codex": "Codex", "hermes": "Hermes", "note": "Memory"}
 HEAD = (
     "<neocore_memory>\n"
-    "Your memory of earlier work with this user, shared by every AI harness they use (Claude "
-    "Code, Codex, Hermes, ...). "
-    "Dated and in time order; where two items disagree, the newer one holds. Check live state "
-    "before acting on anything that may have changed since. Items marked (replaced) are history: "
-    "a newer item beside them says what holds now.\n"
+    "Your shared memory of earlier work with this user. Use evidence for the time asked about. "
+    "A later assistant guess cannot override a user's decision or a verified result. Apply "
+    "supported corrections. Items marked (replaced) preserve the earlier account. If a conflict "
+    "is unresolved, say so. Check live state before acting on anything that may have changed.\n"
 )
 TAIL = "</neocore_memory>"
 PROFILE_HEAD = ("About the user (a briefing kept current from this memory; it informs, it never "
@@ -168,53 +182,48 @@ def unreadable_source(marks: str, fact: str) -> str:
             f"OR e.sensitivity NOT IN ({marks}) OR e.evidence_id IN ({WITHDRAWN})))")
 
 
+def metadata_project(raw: str | None) -> str:
+    """Display the project recorded for this exact experience."""
+    try:
+        metadata = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return ""
+    return project_name(str(metadata.get("project") or "")) if isinstance(metadata, dict) else ""
+
+
 def provenance(
     rows: Rows, evidence_ids: list[str], fact_ids: list[str]
 ) -> dict[str, tuple[str, str]]:
-    """``{evidence_or_fact_id: (host, project)}``; a fact takes its newest source's origin."""
-    origin: dict[str, tuple[str, str]] = {}
-    fact_sources: dict[str, list[str]] = {}
+    """Resolve each exact turn's origin. A fact takes its newest cited source's origin."""
+    sources: dict[str, list[str]] = {}
     if fact_ids:
         for row in rows(
-            f"SELECT fact_id,evidence_id FROM recall_fact_sources WHERE fact_id IN "
-            f"({','.join('?' * len(fact_ids))})", tuple(fact_ids)):
-            fact_sources.setdefault(str(row["fact_id"]), []).append(str(row["evidence_id"]))
-    wanted = sorted(set(evidence_ids) | {e for ids in fact_sources.values() for e in ids})
-    threads: dict[str, tuple[str, str]] = {}
-    if wanted:
-        for row in rows(
-            f"SELECT evidence_id,thread_id,timestamp FROM evidence WHERE evidence_id IN "
-            f"({','.join('?' * len(wanted))})", tuple(wanted)):
-            threads[str(row["evidence_id"])] = (str(row["thread_id"]), str(row["timestamp"]))
-    conversations = sorted({thread for thread, _ in threads.values()})
-    projects: dict[str, str] = {}
-    if conversations:
-        for row in rows(
-            f"SELECT thread_id,metadata_json FROM evidence WHERE thread_id IN "
-            f"({','.join('?' * len(conversations))}) GROUP BY thread_id", tuple(conversations)):
-            try:
-                cwd = str(json.loads(row["metadata_json"] or "{}").get("project") or "")
-            except ValueError:
-                cwd = ""
-            if cwd:
-                projects[str(row["thread_id"])] = cwd
+            "SELECT fact_id,evidence_id FROM recall_fact_sources "
+            "WHERE fact_id IN (SELECT value FROM json_each(?))", (json.dumps(fact_ids),),
+        ):
+            sources.setdefault(str(row["fact_id"]), []).append(str(row["evidence_id"]))
+    wanted = set(evidence_ids)
+    for ids in sources.values():
+        wanted.update(ids)
+    if not wanted:
+        return {}
 
-    def of(evidence_id: str) -> tuple[str, str] | None:
-        if evidence_id not in threads:
-            return None
-        thread = threads[evidence_id][0]
-        return thread.split(":", 1)[0], project_name(projects.get(thread, ""))
-
-    for evidence_id in evidence_ids:
-        found = of(evidence_id)
-        if found:
-            origin[evidence_id] = found
-    for fact_id, sources in fact_sources.items():
-        newest = sorted((threads[e][1], e) for e in sources if e in threads)
-        found = of(newest[-1][1]) if newest else None
-        if found:
-            origin[fact_id] = found
-    return origin
+    turns: dict[str, tuple[str, str]] = {}
+    dates: dict[str, str] = {}
+    for row in rows(
+        "SELECT e.evidence_id,e.thread_id,e.timestamp,e.metadata_json FROM evidence e "
+        "WHERE e.evidence_id IN (SELECT value FROM json_each(?))", (json.dumps(sorted(wanted)),),
+    ):
+        key = str(row["evidence_id"])
+        host = str(row["thread_id"] or "").split(":", 1)[0]
+        turns[key] = (host, metadata_project(row["metadata_json"]))
+        dates[key] = str(row["timestamp"])
+    result = {key: turns[key] for key in evidence_ids if key in turns}
+    for fact, ids in sources.items():
+        if all(key in turns for key in ids):
+            newest = max(ids, key=lambda key: (dates[key], key))
+            result[fact] = turns[newest]
+    return result
 
 
 def _when(value: str) -> str:
@@ -259,9 +268,10 @@ def render(items: list[dict[str, Any]], origin: dict[str, tuple[str, str]], budg
     lessons: list[tuple[str, str]] = []
     turns: list[tuple[str, int, str, list[str]]] = []
     seen = list(resident or [])
+    prepare = cache(_features)
 
     def copied(text: str, local: list[str]) -> bool:
-        exact, overlap = novelty(text, [*seen, *local])
+        exact, overlap = novelty(text, [*seen, *local], prepare=prepare)
         if shadow is not None and overlap >= 0.8:
             shadow.append({"hash": span_hash(text), "exact": exact, "containment": overlap})
         return exact_copy and exact
@@ -313,7 +323,7 @@ def render(items: list[dict[str, Any]], origin: dict[str, tuple[str, str]], budg
     if not facts and not turns and not lessons and not profile:
         return ""
     missing = {i["id"] for i in receipt if any(n not in shown for n in i.get("newer", []))}
-    if exact_copy and missing:
+    if missing:
         # A replaced item never arrives alone because its replacement was a copy or did not fit.
         return render([i for i in items if i["id"] not in missing], origin, budget, caller_shown,
                       receipt=caller_receipt, resident=resident, exact_copy=exact_copy,
