@@ -103,6 +103,16 @@ codex plugin add neocore@neocore
 Pick one way per tool. If `neocore setup` already added its hooks, the plugin's hooks stay quiet,
 so each prompt still gets its memory once.
 
+Two more packages, for directories that don't accept hooks or a local server:
+
+- [`integrations/openai`](integrations/openai): a skills-only plugin for the ChatGPT and Codex
+  plugin directory (desktop only). Its get-started skill installs NeoCore with your go, then the
+  memory tools and hooks above take over.
+- [`Dockerfile`](Dockerfile): the memory server alone (MCP over stdio), for MCP directories and
+  container clients. Memory lives in `/data`.
+
+[PRIVACY.md](PRIVACY.md) says exactly what is stored and what leaves your machine.
+
 After setup:
 
 - **Every prompt** gets the memory that matters, as hook context, in well under a second. A warm
