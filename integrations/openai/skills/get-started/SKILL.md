@@ -16,7 +16,7 @@ NeoCore team unless the user later opts in to "Help improve NeoSift".
    - on a computer with a graphics card, also install NeoSift, the local relevance filter
      (a larger download). The user can skip it with `--no-sift`;
    - add NeoCore's memory server and two hooks to `~/.codex/config.toml` (and to the other AI
-     tools it finds, such as Claude Code), so memory is recalled before each prompt and each turn
+     tools it finds), so memory is recalled before each prompt and each turn
      is saved. Codex asks the user to trust new hooks the first time; NeoCore never trusts them
      for the user.
    Ask for a go. Do nothing until the user agrees.

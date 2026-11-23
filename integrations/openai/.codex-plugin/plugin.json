@@ -1,7 +1,7 @@
 {
   "name": "neocore",
   "version": "0.3.11",
-  "description": "One memory for every AI harness you use. NeoCore keeps a local, dated memory of your Codex, Claude Code, Hermes and other AI sessions and lets Codex search it, open it and add to it.",
+  "description": "One memory for all your AI tools. NeoCore keeps a local, dated memory of your AI coding sessions and lets Codex search it, open it and add to it.",
   "author": {
     "name": "VincentPorquet777",
     "url": "https://github.com/VincentPorquet777/neocore"
@@ -13,20 +13,19 @@
     "memory",
     "recall",
     "codex",
-    "claude-code",
-    "hermes",
-    "local-first"
+    "local-first",
+    "knowledge"
   ],
   "skills": "./skills/",
   "requires_local_executor": true,
   "interface": {
     "displayName": "NeoCore",
-    "shortDescription": "One memory for every harness",
-    "longDescription": "NeoCore is free, open-source (Apache-2.0) memory shared by the AI harnesses you use: Codex, Claude Code, Hermes, Gemini CLI, Cursor, Copilot CLI and opencode. It keeps every conversation turn on your own machine (or your own memory server), forms dated facts from it, and recalls the excerpts a prompt needs with zero model calls at recall.\n\nWith this plugin Codex can: search your past conversations and facts across every harness, open the full turn behind a result, check what was true on a given date, and save something you ask it to remember.\n\nWho it is for: developers who work across several AI tools and are tired of re-explaining their projects, decisions and setup.\n\nLimits: NeoCore runs locally, so this is a desktop-only plugin. It needs the open-source neocore-memory package (Python 3.10+); the get-started skill installs it with your permission and shows every file it will change first. Your memory stays on your machine or your own memory server. Facts are written by an AI tool you already use, and nothing is sent to NeoCore's developers unless you opt in to help train its relevance filter.",
+    "shortDescription": "One memory for all your AI tools",
+    "longDescription": "NeoCore is open-source (Apache-2.0) memory shared by the AI tools you use. It keeps every conversation turn on your own machine (or your own memory server), forms dated facts from it, and recalls the excerpts a prompt needs with zero model calls at recall.\n\nWith this plugin Codex can: search your past conversations and facts, including those from your other AI tools, open the full turn behind a result, check what was true on a given date, and save something you ask it to remember.\n\nWho it is for: developers who work across several AI tools and are tired of re-explaining their projects, decisions and setup.\n\nLimits: NeoCore runs locally, so this is a desktop-only plugin. It needs the open-source neocore-memory package (Python 3.10+); the get-started skill installs it with your permission and shows every file it will change first. Your memory stays on your machine or your own memory server. Facts are written by an AI tool you already use, and nothing is sent to NeoCore's developers unless you opt in to help train its relevance filter.",
     "developerName": "VincentPorquet777",
     "category": "Developer Tools",
     "capabilities": [
-      "Search past conversations across harnesses",
+      "Search past conversations from all your AI tools",
       "Open the full turn behind a memory",
       "Check what was true on a date",
       "Remember something you ask it to"
@@ -34,6 +33,7 @@
     "websiteURL": "https://github.com/VincentPorquet777/neocore",
     "supportURL": "https://github.com/VincentPorquet777/neocore/issues",
     "privacyPolicyURL": "https://github.com/VincentPorquet777/neocore/blob/main/PRIVACY.md",
+    "termsOfServiceURL": "https://github.com/VincentPorquet777/neocore/blob/main/TERMS.md",
     "defaultPrompt": [
       "What did we decide about this project last week?",
       "Search my memory for the deploy steps",
@@ -49,10 +49,10 @@
       "onboardingSkill": "./skills/get-started/SKILL.md",
       "review": {
         "commerce": false,
-        "commerce_description": "NeoCore is free and open source. It sells nothing and processes no payments."
+        "commerce_description": "NeoCore is open source. It sells nothing and processes no payments."
       },
       "publication": {
-        "release_notes": "First directory release: NeoCore 0.3.11 memory for Codex, shared with Claude Code, Hermes and other harnesses."
+        "release_notes": "First directory release: NeoCore 0.3.11 memory for Codex, shared with your other AI tools."
       }
     }
   }

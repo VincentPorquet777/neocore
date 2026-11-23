@@ -111,7 +111,7 @@ Two more packages, for directories that don't accept hooks or a local server:
 - [`Dockerfile`](Dockerfile): the memory server alone (MCP over stdio), for MCP directories and
   container clients. Memory lives in `/data`.
 
-[PRIVACY.md](PRIVACY.md) says exactly what is stored and what leaves your machine.
+[PRIVACY.md](PRIVACY.md) says exactly what is stored and what leaves your machine; [TERMS.md](TERMS.md) has the terms of use.
 
 After setup:
 

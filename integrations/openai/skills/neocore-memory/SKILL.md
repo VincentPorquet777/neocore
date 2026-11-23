@@ -1,6 +1,6 @@
 ---
 name: neocore-memory
-description: Search, open and add to the user's NeoCore memory, shared across Codex, Claude Code, Hermes and their other AI tools. Use when the user refers to earlier work ("last week", "what did we decide", "like before"), asks what they told any assistant, asks you to remember something, or when past decisions, setup or preferences would change your answer.
+description: Search, open and add to the user's NeoCore memory, shared across Codex and the user's other AI tools. Use when the user refers to earlier work ("last week", "what did we decide", "like before"), asks what they told any assistant, asks you to remember something, or when past decisions, setup or preferences would change your answer.
 ---
 
 # NeoCore memory
