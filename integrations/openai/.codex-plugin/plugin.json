@@ -20,7 +20,7 @@
   "requires_local_executor": true,
   "interface": {
     "displayName": "NeoCore",
-    "shortDescription": "One memory for all your AI tools",
+    "shortDescription": "One memory for your AI tools",
     "longDescription": "NeoCore is open-source (Apache-2.0) memory shared by the AI tools you use. It keeps every conversation turn on your own machine (or your own memory server), forms dated facts from it, and recalls the excerpts a prompt needs with zero model calls at recall.\n\nWith this plugin Codex can: search your past conversations and facts, including those from your other AI tools, open the full turn behind a result, check what was true on a given date, and save something you ask it to remember.\n\nWho it is for: developers who work across several AI tools and are tired of re-explaining their projects, decisions and setup.\n\nLimits: NeoCore runs locally, so this is a desktop-only plugin. It needs the open-source neocore-memory package (Python 3.10+); the get-started skill installs it with your permission and shows every file it will change first. Your memory stays on your machine or your own memory server. Facts are written by an AI tool you already use, and nothing is sent to NeoCore's developers unless you opt in to help train its relevance filter.",
     "developerName": "VincentPorquet777",
     "category": "Developer Tools",
