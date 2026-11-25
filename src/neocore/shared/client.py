@@ -403,6 +403,11 @@ def upload_new(remote: Remote, home: Path, *, keep: Callable[[], None] | None = 
             except OSError:
                 continue
             start = int(state.get(name, 0))
+            if start > size:
+                # The app rewrote this transcript shorter (Claude Code does on long chats): the
+                # old offset points past its end and would skip the chat for good. Read it again
+                # from the start; the server answers "duplicate" for turns it already holds.
+                start = 0
             if start >= size or guard.skip(name, start, size):
                 continue
             batch: list[dict[str, Any]] = []

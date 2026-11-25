@@ -609,6 +609,8 @@ class DevMemory:
                 key = str(path)
                 size = path.stat().st_size
                 start = int(state.get(key, 0))
+                if start > size:  # rewritten shorter by the app: read again; capture skips repeats
+                    start = 0
                 if start >= size or guard.skip(key, start, size):
                     continue
                 for turn, after in reader(path, start):
@@ -1420,9 +1422,20 @@ def _sync(home: Path | None = None) -> dict[str, Any]:
         def keep() -> None:
             _renew_sync(lock)
 
-        return {"ingested": memory.ingest(keep), **memory.maintain(keep)}
+        return {"ingested": memory.ingest(keep), **memory.maintain(keep), **_maybe_update()}
     finally:
         _release_sync(lock)
+
+
+def _maybe_update() -> dict[str, Any]:
+    """The once-a-day update check (``neocore.update``); never costs the sync."""
+    try:
+        from neocore import update
+
+        result = update.check(HOME)
+    except Exception:  # noqa: BLE001
+        return {}
+    return {} if result.get("status") in ("not due", "off") else {"update": result}
 
 
 # -- hosts ----------------------------------------------------------------------------------
@@ -1691,8 +1704,15 @@ def _serve(token: str, socket: Any) -> None:
         finally:
             sockets.release()
 
+    from neocore import update
+
+    running, looked = update.installed(), time.monotonic()
     try:
         while time.monotonic() - activity[0] < IDLE_SECONDS:
+            if time.monotonic() - looked > 60:
+                looked = time.monotonic()
+                if update.installed() != running:
+                    break  # updated: the next prompt starts a daemon on the new code
             try:
                 connection, _ = listener.accept()
             except TimeoutError:
@@ -1944,19 +1964,23 @@ def claude_prompt_hook(host: str = "claude-code") -> None:
         found = recall_for_prompt(host, prompt, str(event.get("session_id") or ""),
                                   str(event.get("transcript_path") or ""), started=started,
                                   deadline=deadline, request_id=request_id, replaced=replaced)
-        if found is None:
-            return
-        answer, remote = found
+        answer, remote = found if found is not None else ({}, None)
         output: dict[str, Any] = {}
         if answer.get("text"):
             output["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit",
                                             "additionalContext": answer["text"]}
-        if answer.get("notice"):
-            output["systemMessage"] = answer["notice"]  # shown to the user, not the model
+        notices = [str(answer["notice"])] if answer.get("notice") else []
+        if host in NOTICE_HOSTS:
+            from neocore import update
+
+            notices += [n for n in [update.take_notice(HOME)] if n]
+        if notices:
+            output["systemMessage"] = " ".join(notices)  # shown to the user, not the model
         if not output:
             return
         print(json.dumps(output), flush=True)
-        confirm_delivery(answer, remote, started)
+        if found is not None:
+            confirm_delivery(answer, remote, started)
     except Exception:
         return  # never block the prompt
 
@@ -1989,7 +2013,8 @@ def _upload() -> dict[str, Any]:
     except OSError:
         pass
     try:
-        return client.upload_new(remote, HOME, keep=lambda: _renew_sync(lock))
+        return {**client.upload_new(remote, HOME, keep=lambda: _renew_sync(lock)),
+                **_maybe_update()}
     finally:
         _release_sync(lock)
 

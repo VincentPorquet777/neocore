@@ -6,6 +6,7 @@
     neocore sift install [--force] | remove | status   (NeoSift, the local relevance filter)
     neocore share on | off | status | send | delete     (opt-in: help train NeoSift)
     neocore rules add | remove | list | check | build | stats | off | on   (``neocore rules -h``)
+    neocore update [status | auto on|off]   install the newest release now (checked daily)
     neocore uninstall
     neocore doctor
     neocore recall "QUERY" | status | stats | sync ...  (memory commands: ``neocore memory -h``)
@@ -743,6 +744,10 @@ def main(argv: list[str] | None = None) -> None:
     if argv[:1] == ["undo"]:
         undo_command(argv[1:])
         return
+    if argv[:1] == ["update"]:
+        from neocore import update
+
+        sys.exit(update.command(argv[1:], memory.HOME))
     if argv[:1] == ["hygiene"]:
         hygiene_command(argv[1:])
         return
