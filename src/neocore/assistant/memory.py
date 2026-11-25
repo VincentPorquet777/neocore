@@ -46,6 +46,7 @@ import time
 import uuid
 from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
@@ -105,7 +106,10 @@ def _bounded_stage(
         raise
     future.add_done_callback(lambda _: _STAGE_SLOTS.release())
     try:
-        result = future.result(timeout=deadline.remaining())
+        try:
+            result = future.result(timeout=deadline.remaining())
+        except FutureTimeoutError:  # a different class from TimeoutError before Python 3.11
+            raise TimeoutError("recall deadline") from None
         deadline.check()
         return result
     finally:

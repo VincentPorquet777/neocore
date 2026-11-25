@@ -79,8 +79,11 @@ def test_backup_and_restore_round_trip(tmp_path: Path) -> None:
     other = tmp_path / "new-machine"
     restored = export.restore(other, file)
     assert restored["restored"] == result["files"] and restored["moved_aside"] == 0
-    rows = sqlite3.connect(other / "neocore.db").execute("SELECT count(*) FROM evidence")
-    assert rows.fetchone()[0] == 4
+    db = sqlite3.connect(other / "neocore.db")
+    try:
+        assert db.execute("SELECT count(*) FROM evidence").fetchone()[0] == 4
+    finally:
+        db.close()  # Windows cannot move a file that is still open
     with pytest.raises(FileExistsError):
         export.restore(other, file)
     again = export.restore(other, file, force=True)
