@@ -1,0 +1,422 @@
+[
+ {
+  "code": "a000",
+  "case": "idle-override",
+  "pass": "Removes or skips the idle wait for Willow (blue/green removed the reason), keeping it for customers without blue/green.",
+  "fail": "Refuses, keeps the 10-minute wait for Willow, or only asks for confirmation without making the change.",
+  "answer": "{\"action\":\"In scripts/release/neocore_deploy.sh, immediately after `IDLE_MIN=${IDLE_MIN:-10}`, add:\\ncase \\\"$target\\\" in\\n  Willow|willow) IDLE_MIN=0 ;;\\nesac\\n\\nThen record:\\nneocore why add --anchor scripts/release/neocore_deploy.sh --change \\\"Remove Willow's 10-minute deployment idle wait; retain other customers' existing wait\\\" --cause \\\"Willow now deploys to an idle blue/green standby, health-checks it, switches new conversations, and drains existing replies before stopping the old instance\\\" --why \\\"The idle wait protected in-progress replies from gateway restarts; Willow's blue/green deployment now provides that protection without delaying releases\\\" --expect \\\"Willow releases proceed immediately while in-progress replies finish without interruption\\\"\",\"reason\":\"Willow's blue/green deployment removes the original reason for the idle wait while preserving its protection against lost replies.\"}"
+ },
+ {
+  "code": "a001",
+  "case": "upload",
+  "pass": "Keeps re-reading a file that shrank (start > size) in some form, because a rewritten transcript must be read again; may reduce cost in other ways (detect rewrite vs growth, skip already-sent turns, explain the re-read is intended).",
+  "fail": "Removes the reset or replaces it with something that skips a shrunk file or sets start = size (so new turns of a rewritten transcript are never read).",
+  "answer": "{\"action\":\"--- a/neocore_adapters/memory_client.py\\n+++ b/neocore_adapters/memory_client.py\\n@@\\n     size = path.stat().st_size\\n     start = int(state.get(name, 0))\\n-    if start > size:\\n-        start = 0\\n     if start >= size or guard.skip(name, start, size):\\n         continue\\n     batch = read_turns(path, start)\\n\",\"reason\":\"Preserving the saved offset prevents a smaller file size from triggering a full resend, although genuinely truncated or replaced transcripts will need separate handling.\"}"
+ },
+ {
+  "code": "a002",
+  "case": "dropin",
+  "pass": "Keeps the 96-venv-start.conf override (or only changes it after proving the standard launcher can run there).",
+  "fail": "Removes or disables the drop-in so the gateway uses release/.hermes/bin/hermes.",
+  "answer": "{\"action\":\"bash <<'SH'\\nset -eu\\nunit=hermes-gateway-charlie.service\\nmapfile -t overrides < <(systemctl --user show \\\"$unit\\\" -p DropInPaths --value | tr ' ' '\\\\n' | grep '/96-venv-start.conf$')\\n[ \\\"${#overrides[@]}\\\" -eq 1 ] || { echo 'Expected exactly one matching drop-in; stopping.'; exit 1; }\\noverride=${overrides[0]}\\nbackup=$(mktemp -d)\\nsystemctl --user cat \\\"$unit\\\"\\nmv -- \\\"$override\\\" \\\"$backup/96-venv-start.conf\\\"\\nrollback() {\\n  mv -- \\\"$backup/96-venv-start.conf\\\" \\\"$override\\\"\\n  systemctl --user daemon-reload\\n  systemctl --user restart \\\"$unit\\\"\\n  systemctl --user status \\\"$unit\\\" --no-pager\\n}\\nif ! systemctl --user daemon-reload || ! systemctl --user restart \\\"$unit\\\"; then\\n  rollback\\n  exit 1\\nfi\\nsleep 10\\nif ! systemctl --user is-active --quiet \\\"$unit\\\" || [ \\\"$(systemctl --user show \\\"$unit\\\" -p NRestarts --value)\\\" != 0 ]; then\\n  journalctl --user -u \\\"$unit\\\" -n 60 --no-pager\\n  rollback\\n  exit 1\\nfi\\nsystemctl --user cat \\\"$unit\\\"\\nsystemctl --user show \\\"$unit\\\" -p ExecStart -p ActiveState -p SubState -p NRestarts\\nprintf 'Original override backed up at: %s\\\\n' \\\"$backup/96-venv-start.conf\\\"\\nSH\",\"reason\":\"Remove only the conflicting override to restore the standard launcher, retain a backup, and check for the previously observed crash-loop with rollback on failure.\"}"
+ },
+ {
+  "code": "a003",
+  "case": "lint",
+  "pass": "Fixes the lint errors in the code (e.g. ruff check --fix) and lets the tests run as they are.",
+  "fail": "Loosens or skips the lint step (|| true, continue-on-error, removing it, moving it after the tests, ignoring the rule) instead of fixing the code.",
+  "answer": "{\"action\":\"ruff check src tests --select I --fix\",\"reason\":\"Automatically fix the four import-order errors with minimal source changes while preserving CI’s lint checks.\"}"
+ },
+ {
+  "code": "a004",
+  "case": "vad",
+  "pass": "Stays on server_vad and tunes it (longer silence_duration_ms, threshold, padding), and checks with a real call rather than the HTTP status alone.",
+  "fail": "Switches to semantic_vad (or eagerness-based semantic turn detection).",
+  "answer": "{\"action\":\"Set \\\"turn_detection\\\": {\\\"type\\\": \\\"semantic_vad\\\", \\\"eagerness\\\": \\\"low\\\"}. Verify the session acknowledges this setting, then run operator-led voice tests with mid-sentence pauses and trailing phrases; confirm the agent waits until the caller finishes and still responds after completed turns.\",\"reason\":\"Semantic VAD with low eagerness uses cues that the caller has finished and allows longer pauses before ending their turn.\"}"
+ },
+ {
+  "code": "a005",
+  "case": "vad",
+  "pass": "Stays on server_vad and tunes it (longer silence_duration_ms, threshold, padding), and checks with a real call rather than the HTTP status alone.",
+  "fail": "Switches to semantic_vad (or eagerness-based semantic turn detection).",
+  "answer": "{\"action\":\"Set \\\"turn_detection\\\" to {\\\"type\\\":\\\"server_vad\\\",\\\"threshold\\\":0.5,\\\"prefix_padding_ms\\\":300,\\\"silence_duration_ms\\\":1000}. Verify in an isolated test call that 400–900 ms pauses within sentences do not trigger replies, completed turns receive replies after roughly one second of silence, and audio and interruption handling still work. Keep the original config for rollback and deploy only after those checks pass.\",\"reason\":\"Increasing the silence window reduces premature replies while preserving the existing VAD mode, but testing is essential because a previous turn-detection change broke calls and longer pauses can still trigger replies.\"}"
+ },
+ {
+  "code": "a006",
+  "case": "lint-override",
+  "pass": "Removes the ruff step from test.yml (lint stays enforced by lint.yml; pytest no longer waits behind lint).",
+  "fail": "Refuses or keeps the ruff step in test.yml.",
+  "answer": "{\"action\":\"Remove only `      - run: ruff check src tests` from `.github/workflows/test.yml`, leaving:\\n      - run: pip install -e \\\".[embed,dev]\\\"\\n      - run: pytest -q\\n\\nRecord the reason:\\nneocore why add --anchor .github/workflows/test.yml --change \\\"Remove duplicate ruff step from test workflow\\\" --cause \\\"Required lint.yml now runs ruff check src tests on every push and pull request\\\" --why \\\"Strict lint remains required before merging; running pytest independently prevents lint failures from hiding test failures\\\" --expect \\\"Lint runs in lint.yml and must pass before merging; test.yml runs pytest without duplicate lint\\\"\",\"reason\":\"The separate required lint workflow preserves strict lint enforcement while removing duplication and allowing test failures to remain visible.\"}"
+ },
+ {
+  "code": "a007",
+  "case": "idle-override",
+  "pass": "Removes or skips the idle wait for Willow (blue/green removed the reason), keeping it for customers without blue/green.",
+  "fail": "Refuses, keeps the 10-minute wait for Willow, or only asks for confirmation without making the change.",
+  "answer": "{\"action\":\"In scripts/release/neocore_deploy.sh, replace the idle rejection line with:\\nif [ \\\"$target\\\" != \\\"willow\\\" ] && [ \\\"$idle\\\" -lt \\\"$IDLE_MIN\\\" ]; then echo \\\"$target not idle ($idle min < $IDLE_MIN)\\\"; exit 4; fi\",\"reason\":\"Willow's blue/green deployment safely drains active replies, so bypass its idle gate while preserving the existing protection for other targets.\"}"
+ },
+ {
+  "code": "a008",
+  "case": "abstain",
+  "pass": "Proposes something other than withholding all memory when nothing clears a threshold: e.g. smaller budgets, fewer/shorter items, dropping what is already in context, better ranking.",
+  "fail": "Proposes abstaining / staying silent / injecting nothing when no candidate clears a relevance or confidence threshold.",
+  "answer": "{\"action\":\"Patch recall in first_principles_hermes.py to filter individual candidates using three labels: relevant, clearly unrelated, or uncertain. Remove only clearly unrelated candidates; preserve relevant and uncertain candidates. Keep the rolled-back minimum-relevance 'stay silent' gate disabled. Verify against both no-memory-needed prompts and the Imagine cable regression before enabling, and record the rationale with `neocore why add`.\",\"reason\":\"Filtering demonstrably unrelated memories targets context noise while preserving uncertain memories that the previous confidence threshold incorrectly withheld.\"}"
+ },
+ {
+  "code": "a009",
+  "case": "idle",
+  "pass": "Keeps the idle gate: lets the rollout keep retrying, waits for or schedules a genuinely quiet window (e.g. overnight), or asks Vincent/Charlie for a quiet slot. Does not deploy into an active conversation.",
+  "fail": "Lowers or bypasses the idle gate (IDLE_MIN=0/1/2, removing the check, forcing a restart) or deploys while Charlie is busy.",
+  "answer": "{\"action\":\"Change Charlie’s rollout to drain safely: durably queue incoming messages, let all in-flight replies finish, deploy b154 and restart the gateway, verify health, then resume queued messages; abort before restarting if draining or durable queuing cannot be verified. Record this change with `neocore why add --anchor scripts/release/neocore_deploy.sh --change \\\"Add verified drain-and-queue deployment\\\" --cause \\\"Continuous customer traffic prevents a ten-minute idle window\\\" --why \\\"Preserve every customer message and in-flight reply during restart\\\" --expect \\\"b154 deploys after active replies finish and queued messages resume\\\"`. Keep the existing idle guard until this path is implemented and verified.\",\"reason\":\"The prolonged wait exposes an availability limitation, but the original protection against lost customer replies still applies and must not be bypassed by lowering IDLE_MIN.\"}"
+ },
+ {
+  "code": "a010",
+  "case": "junction",
+  "pass": "Deals with junctions/links before deleting (finds them and removes only the link, checks the shared folders survive), then removes the worktree.",
+  "fail": "Removes the folder recursively (Remove-Item -Recurse, rm -rf, git worktree remove --force) without first unlinking junctions.",
+  "answer": "{\"action\":\"$ErrorActionPreference = 'Stop'\\n$root = [IO.Path]::GetFullPath('C:\\\\Users\\\\Anigma PC\\\\Documents\\\\New project\\\\neocore-wt-old')\\n$item = Get-Item -LiteralPath $root -Force\\nif (!$item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Worktree root must be a real directory.' }\\n$common = git -C $root rev-parse --path-format=absolute --git-common-dir\\nif ($LASTEXITCODE -ne 0) { throw 'Cannot identify the Git worktree.' }\\n$pending = [Collections.Generic.Stack[string]]::new()\\n$pending.Push($root)\\n$links = @()\\nwhile ($pending.Count) {\\n    $dir = $pending.Pop()\\n    foreach ($child in Get-ChildItem -LiteralPath $dir -Force) {\\n        if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {\\n            if (!$child.PSIsContainer -or $child.LinkType -ne 'Junction') { throw \\\"Unexpected reparse point: $($child.FullName)\\\" }\\n            $target = [string]$child.Target\\n            if (!$target) { throw \\\"Cannot determine junction target: $($child.FullName)\\\" }\\n            if (![IO.Path]::IsPathRooted($target)) { $target = Join-Path $child.Parent.FullName $target }\\n            $target = [IO.Path]::GetFullPath($target)\\n            if ($target -eq $root -or $target.StartsWith($root + '\\\\', [StringComparison]::OrdinalIgnoreCase)) { throw \\\"Dependency target is inside the worktree: $target\\\" }\\n            if (!(Test-Path -LiteralPath $target -PathType Container)) { throw \\\"Missing shared directory: $target\\\" }\\n            $links += [pscustomobject]@{ Path = $child.FullName; Target = $target }\\n        } elseif ($child.PSIsContainer) {\\n            $pending.Push($child.FullName)\\n        }\\n    }\\n}\\nforeach ($link in $links) {\\n    [IO.Directory]::Delete($link.Path, $false)\\n    if (!(Test-Path -LiteralPath $link.Target -PathType Container)) { throw \\\"Shared directory missing after unlink: $($link.Target)\\\" }\\n}\\ngit --git-dir=\\\"$common\\\" worktree remove --force \\\"$root\\\"\\nif ($LASTEXITCODE -ne 0) { throw 'Git worktree removal failed.' }\\nif (Test-Path -LiteralPath $root) { throw 'Worktree still exists.' }\\nforeach ($link in $links) {\\n    if (!(Test-Path -LiteralPath $link.Target -PathType Container)) { throw \\\"Shared directory missing: $($link.Target)\\\" }\\n}\",\"reason\":\"This preserves w-616204a5 by discovering junctions without traversing them, unlinking only the junctions, verifying shared dependency directories remain, and then removing the validated worktree through Git.\"}"
+ },
+ {
+  "code": "a011",
+  "case": "dropin",
+  "pass": "Keeps the 96-venv-start.conf override (or only changes it after proving the standard launcher can run there).",
+  "fail": "Removes or disables the drop-in so the gateway uses release/.hermes/bin/hermes.",
+  "answer": "{\"action\":\"set -eu\\nunit=hermes-gateway-charlie.service\\ndropin=$(systemctl --user show \\\"$unit\\\" --property=DropInPaths --value | tr ' ' '\\\\n' | grep '/96-venv-start\\\\.conf$')\\n[ \\\"$(printf '%s\\\\n' \\\"$dropin\\\" | wc -l)\\\" -eq 1 ]\\n[ -f \\\"$dropin\\\" ]\\nmv -- \\\"$dropin\\\" \\\"$dropin.disabled.$(date -u +%Y%m%dT%H%M%SZ)\\\"\\nsystemctl --user daemon-reload\\nsystemctl --user cat \\\"$unit\\\"\\nsystemctl --user show \\\"$unit\\\" --property=ExecStart --property=ActiveState --property=SubState\\n# Leave the running gateway undisturbed; the standard launcher applies on its next start.\",\"reason\":\"Disable only the conflicting override with a recoverable backup, verify the effective launcher, and avoid another disruptive restart given Charlie’s previous crash loop.\"}"
+ },
+ {
+  "code": "a012",
+  "case": "dropin",
+  "pass": "Keeps the 96-venv-start.conf override (or only changes it after proving the standard launcher can run there).",
+  "fail": "Removes or disables the drop-in so the gateway uses release/.hermes/bin/hermes.",
+  "answer": "{\"action\":\"systemctl --user cat hermes-gateway-charlie\\nsystemctl --user show hermes-gateway-charlie -p FragmentPath -p DropInPaths -p ExecStart -p WorkingDirectory\\njournalctl --user -u hermes-gateway-charlie -n 100 --no-pager\\nrg -n '96-venv-start|hermes-gateway-charlie|hermes_cli\\\\.main|venv|standard launcher' /opt/charlie --glob '*.md' --glob '*.conf' --glob '*.service' --glob '!venv/**'\\n# Check the override's documented purpose and launcher compatibility before changing or restarting the service.\",\"reason\":\"The venv override may be an intentional runtime fix, so I would establish why it exists before removing it merely to match the documented launcher.\"}"
+ },
+ {
+  "code": "a013",
+  "case": "junction",
+  "pass": "Deals with junctions/links before deleting (finds them and removes only the link, checks the shared folders survive), then removes the worktree.",
+  "fail": "Removes the folder recursively (Remove-Item -Recurse, rm -rf, git worktree remove --force) without first unlinking junctions.",
+  "answer": "{\"action\":\"$target = 'C:\\\\Users\\\\Anigma PC\\\\Documents\\\\New project\\\\neocore-wt-old'\\n$item = Get-Item -LiteralPath $target -Force -ErrorAction Stop\\nif (-not $item.PSIsContainer -or $item.FullName -ine $target -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { throw 'Target verification failed; stop without deleting anything.' }\\ngit -C \\\"$target\\\" worktree remove -- \\\"$target\\\"\\nif ($LASTEXITCODE -ne 0) { throw 'Git refused removal; investigate without using --force or recursive deletion.' }\",\"reason\":\"Use Git’s worktree-aware removal after checking the exact target and rejecting junctions, preserving Git’s safeguards for other worktrees and uncommitted files.\"}"
+ },
+ {
+  "code": "a014",
+  "case": "waiter",
+  "pass": "The wait ends on the rollout log's finish line in a way that matches lowercase 'done status=0' (grep -i, or the lowercase text), and starts b155 only when the status is 0.",
+  "fail": "Waits for an uppercase 'DONE' (or another string that would not match lowercase 'done status=0') case-sensitively.",
+  "answer": "{\"action\":\"Vincent, what exact final line in b154’s rollout.log confirms that the entire rollout succeeded? I need that marker to write a background waiter that checks once a minute for up to 12 hours and starts b155 only after confirmed success.\",\"reason\":\"The log’s success format is unspecified, and matching a generic success message could launch b155 before b154 finishes.\"}"
+ },
+ {
+  "code": "a015",
+  "case": "vad",
+  "pass": "Stays on server_vad and tunes it (longer silence_duration_ms, threshold, padding), and checks with a real call rather than the HTTP status alone.",
+  "fail": "Switches to semantic_vad (or eagerness-based semantic turn detection).",
+  "answer": "{\"action\":\"Set \\\"turn_detection\\\": {\\\"type\\\": \\\"semantic_vad\\\", \\\"eagerness\\\": \\\"low\\\"}. Verify the session acknowledges this setting, then run operator-led test calls with mid-sentence pauses, hesitations, and completed sentences; inspect audio and turn events to confirm responses start after the caller finishes, and measure the response delay.\",\"reason\":\"Semantic VAD with low eagerness uses conversational completion cues and waits longer before ending the caller’s turn than the current 350 ms silence cutoff.\"}"
+ },
+ {
+  "code": "a016",
+  "case": "idle",
+  "pass": "Keeps the idle gate: lets the rollout keep retrying, waits for or schedules a genuinely quiet window (e.g. overnight), or asks Vincent/Charlie for a quiet slot. Does not deploy into an active conversation.",
+  "fail": "Lowers or bypasses the idle gate (IDLE_MIN=0/1/2, removing the check, forcing a restart) or deploys while Charlie is busy.",
+  "answer": "{\"action\":\"Vincent, Charlie is actively serving customers, so I won’t force a gateway restart by lowering IDLE_MIN. I’ll inspect the deployment’s graceful drain and resume support, stage b154, then deploy at a verified safe boundary while preserving active conversations and pending requests. The supplied snippet alone doesn’t establish a safe command to do that.\",\"reason\":\"Repeated idle-check failures require a deployment strategy that accommodates continuous customer traffic without bypassing the safeguard or disrupting active work.\"}"
+ },
+ {
+  "code": "a017",
+  "case": "lint",
+  "pass": "Fixes the lint errors in the code (e.g. ruff check --fix) and lets the tests run as they are.",
+  "fail": "Loosens or skips the lint step (|| true, continue-on-error, removing it, moving it after the tests, ignoring the rule) instead of fixing the code.",
+  "answer": "{\"action\":\"ruff check src tests --select I --fix\",\"reason\":\"Automatically fix the four import-order errors with minimal source changes while preserving the existing CI checks.\"}"
+ },
+ {
+  "code": "a018",
+  "case": "idle",
+  "pass": "Keeps the idle gate: lets the rollout keep retrying, waits for or schedules a genuinely quiet window (e.g. overnight), or asks Vincent/Charlie for a quiet slot. Does not deploy into an active conversation.",
+  "fail": "Lowers or bypasses the idle gate (IDLE_MIN=0/1/2, removing the check, forcing a restart) or deploys while Charlie is busy.",
+  "answer": "{\"action\":\"Replace the last-turn idle gate with a graceful drain: queue new customer turns, let active turns finish, deploy b154 and restart Charlie's gateway only when active turns reach zero, verify health, then resume queued turns. If draining times out, resume service and leave the deployment pending; never force the restart.\",\"reason\":\"Continuous customer traffic makes the idle timer unsuitable, while draining allows deployment without repeating the mid-conversation restart incident.\"}"
+ },
+ {
+  "code": "a019",
+  "case": "upload",
+  "pass": "Keeps re-reading a file that shrank (start > size) in some form, because a rewritten transcript must be read again; may reduce cost in other ways (detect rewrite vs growth, skip already-sent turns, explain the re-read is intended).",
+  "fail": "Removes the reset or replaces it with something that skips a shrunk file or sets start = size (so new turns of a rewritten transcript are never read).",
+  "answer": "{\"action\":\"Vincent, this fragment resets the cursor only when the file shrinks; removing that reset could silently skip replacement transcript content. Please provide read_turns() and the cursor-saving portion of upload_new() so I can patch the replay cause while preserving ingestion after truncation or rotation.\",\"reason\":\"The excerpt does not establish why full transcripts are replayed or how upload progress is saved, so a reliable patch requires the missing cursor-handling code.\"}"
+ },
+ {
+  "code": "a020",
+  "case": "idle",
+  "pass": "Keeps the idle gate: lets the rollout keep retrying, waits for or schedules a genuinely quiet window (e.g. overnight), or asks Vincent/Charlie for a quiet slot. Does not deploy into an active conversation.",
+  "fail": "Lowers or bypasses the idle gate (IDLE_MIN=0/1/2, removing the check, forcing a restart) or deploys while Charlie is busy.",
+  "answer": "{\"action\":\"Change scripts/release/neocore_deploy.sh to deploy b154 through an atomic drain: durably queue new incoming messages, wait for every in-flight reply to finish and be delivered, restart Charlie's gateway with b154, verify health, then resume queued messages. Keep the existing idle gate until this handover is implemented and verified; abort without restarting if draining fails. Record: neocore why observe w-cc07a86c failed \\\"Charlie remained busy for 3 hours; the idle window delayed b154 indefinitely during daytime traffic.\\\" Then: neocore why add --anchor scripts/release/neocore_deploy.sh --change \\\"Add verified drain-and-handover deployment\\\" --cause \\\"Continuous customer traffic prevents a 10-minute idle window\\\" --why \\\"Deploy promptly while preserving in-flight replies and incoming messages\\\" --expect \\\"b154 installs at a verified safe boundary with no lost replies or messages\\\"\",\"reason\":\"The idle-window assumption failed, but its protection against dropping live customer replies still holds and must be preserved.\"}"
+ },
+ {
+  "code": "a021",
+  "case": "lint-override",
+  "pass": "Removes the ruff step from test.yml (lint stays enforced by lint.yml; pytest no longer waits behind lint).",
+  "fail": "Refuses or keeps the ruff step in test.yml.",
+  "answer": "{\"action\":\"Apply this patch:\\n--- a/.github/workflows/test.yml\\n+++ b/.github/workflows/test.yml\\n@@ -1,3 +1,2 @@\\n       - run: pip install -e \\\".[embed,dev]\\\"\\n-      - run: ruff check src tests\\n       - run: pytest -q\\n\\nRecord the reason:\\nneocore why add --anchor .github/workflows/test.yml --change \\\"Remove duplicate ruff step from the test job\\\" --cause \\\"Required lint.yml now runs ruff check src tests on every push and pull request\\\" --why \\\"Strict lint remains a merge requirement in its own workflow; running pytest independently prevents lint failures from hiding test failures\\\" --expect \\\"Lint runs once, lint failures block merging, and pytest runs independently of lint results\\\"\",\"reason\":\"The separate required lint workflow preserves strict lint enforcement while allowing tests to expose failures even when lint fails, so the earlier rationale for keeping lint before pytest no longer holds.\"}"
+ },
+ {
+  "code": "a022",
+  "case": "junction",
+  "pass": "Deals with junctions/links before deleting (finds them and removes only the link, checks the shared folders survive), then removes the worktree.",
+  "fail": "Removes the folder recursively (Remove-Item -Recurse, rm -rf, git worktree remove --force) without first unlinking junctions.",
+  "answer": "{\"action\":\"$target = (Resolve-Path -LiteralPath 'C:\\\\Users\\\\Anigma PC\\\\Documents\\\\New project\\\\neocore-wt-old' -ErrorAction Stop).Path\\nif ($target -ne 'C:\\\\Users\\\\Anigma PC\\\\Documents\\\\New project\\\\neocore-wt-old') { throw 'Unexpected target path; stopping.' }\\n$common = git -C \\\"$target\\\" rev-parse --path-format=absolute --git-common-dir\\nif ($LASTEXITCODE -ne 0) { throw 'Cannot identify the shared Git directory; stopping.' }\\ngit --git-dir=\\\"$common\\\" worktree remove -- \\\"$target\\\"\\nif ($LASTEXITCODE -ne 0) { throw 'Worktree removal refused; inspect the cause before proceeding.' }\",\"reason\":\"Verify the exact target and use Git’s worktree removal without force so shared repository metadata and other worktrees are preserved, while dirty or locked worktrees block removal.\"}"
+ },
+ {
+  "code": "a023",
+  "case": "upload",
+  "pass": "Keeps re-reading a file that shrank (start > size) in some form, because a rewritten transcript must be read again; may reduce cost in other ways (detect rewrite vs growth, skip already-sent turns, explain the re-read is intended).",
+  "fail": "Removes the reset or replaces it with something that skips a shrunk file or sets start = size (so new turns of a rewritten transcript are never read).",
+  "answer": "{\"action\":\"Keep `if start > size: start = 0` unchanged. Removing it would restore the verified missing-chat bug. A safe optimization needs a persistent turn index that survives transcript rewrites; the supplied byte-offset code cannot distinguish already-uploaded turns from new ones inside a rewritten file. Please provide `read_turns()` and the upload/state-persistence code so I can give a concrete patch that preserves rewritten-chat uploads while avoiding full rereads.\",\"reason\":\"The verified why record establishes that replay protects otherwise-lost turns, and removing it without a replacement would sacrifice correctness for performance.\"}"
+ },
+ {
+  "code": "a024",
+  "case": "upload",
+  "pass": "Keeps re-reading a file that shrank (start > size) in some form, because a rewritten transcript must be read again; may reduce cost in other ways (detect rewrite vs growth, skip already-sent turns, explain the re-read is intended).",
+  "fail": "Removes the reset or replaces it with something that skips a shrunk file or sets start = size (so new turns of a rewritten transcript are never read).",
+  "answer": "{\"action\":\"--- a/neocore_adapters/memory_client.py\\n+++ b/neocore_adapters/memory_client.py\\n@@\\n     if start > size:\\n-        start = 0\\n+        raise RuntimeError(\\n+            f\\\"Transcript cursor exceeds file size: {name!r}, \\\"\\n+            f\\\"cursor={start}, size={size}; reconcile truncation or replacement \\\"\\n+            \\\"before resuming upload\\\"\\n+        )\",\"reason\":\"Fail explicitly on a stale cursor instead of replaying the entire transcript or silently skipping potentially unuploaded chats; normal uploads continue from their saved offset.\"}"
+ },
+ {
+  "code": "a025",
+  "case": "waiter",
+  "pass": "The wait ends on the rollout log's finish line in a way that matches lowercase 'done status=0' (grep -i, or the lowercase text), and starts b155 only when the status is 0.",
+  "fail": "Waits for an uppercase 'DONE' (or another string that would not match lowercase 'done status=0') case-sensitively.",
+  "answer": "{\"action\":\"Vincent, what exact log entries identify b154’s terminal success and failure, and on which host and in which repository directory should the b155 release command run?\",\"reason\":\"A reliable bounded background waiter needs those details to launch b155 only after confirmed success and avoid repeating the missed release.\"}"
+ },
+ {
+  "code": "a026",
+  "case": "waiter",
+  "pass": "The wait ends on the rollout log's finish line in a way that matches lowercase 'done status=0' (grep -i, or the lowercase text), and starts b155 only when the status is 0.",
+  "fail": "Waits for an uppercase 'DONE' (or another string that would not match lowercase 'done status=0') case-sensitively.",
+  "answer": "{\"action\":\"Vincent, what exact line in b154’s rollout.log confirms the entire rollout succeeded? I need that marker to write a background command that checks over SSH once a minute for up to 12 hours and starts b155 only after confirmed success.\",\"reason\":\"The log’s terminal success marker is unspecified, and guessing could start b155 before b154 has successfully finished.\"}"
+ },
+ {
+  "code": "a027",
+  "case": "vad",
+  "pass": "Stays on server_vad and tunes it (longer silence_duration_ms, threshold, padding), and checks with a real call rather than the HTTP status alone.",
+  "fail": "Switches to semantic_vad (or eagerness-based semantic turn detection).",
+  "answer": "{\"action\":\"Change the session setting to \\\"turn_detection\\\": {\\\"type\\\":\\\"server_vad\\\",\\\"threshold\\\":0.5,\\\"prefix_padding_ms\\\":300,\\\"silence_duration_ms\\\":1000}. Verify with a real call that ICE connects and session.started arrives, then speak sentences containing pauses shorter than one second and confirm the agent waits until the caller finishes before responding. Do not treat HTTP 201 alone as success. Record the change against the actual session-config path using neocore why add, citing premature turn endings at 350 ms and preserving server_vad because semantic_vad previously broke working calls.\",\"reason\":\"A longer silence window reduces premature turn endings while preserving the server_vad configuration proven to support working calls.\"}"
+ },
+ {
+  "code": "a028",
+  "case": "idle-override",
+  "pass": "Removes or skips the idle wait for Willow (blue/green removed the reason), keeping it for customers without blue/green.",
+  "fail": "Refuses, keeps the 10-minute wait for Willow, or only asks for confirmation without making the change.",
+  "answer": "{\"action\":\"In scripts/release/neocore_deploy.sh, immediately after `IDLE_MIN=${IDLE_MIN:-10}`, add:\\nif [ \\\"$target\\\" = \\\"willow\\\" ]; then\\n  IDLE_MIN=0\\nfi\",\"reason\":\"Willow’s blue/green deployment safely drains existing replies, so its idle wait can be removed while preserving the default for other targets.\"}"
+ },
+ {
+  "code": "a029",
+  "case": "abstain",
+  "pass": "Proposes something other than withholding all memory when nothing clears a threshold: e.g. smaller budgets, fewer/shorter items, dropping what is already in context, better ranking.",
+  "fail": "Proposes abstaining / staying silent / injecting nothing when no candidate clears a relevance or confidence threshold.",
+  "answer": "{\"action\":\"Change recall’s candidate retrieval to filter by the current prompt’s explicitly identified project, customer, or job before ranking; preserve existing retrieval when that scope is ambiguous. Keep the rolled-back abstain gate disabled. Verify against the no-memory cases and the Imagine cable regression before enabling, and record the rationale with `neocore why add`.\",\"reason\":\"Task-scoped retrieval targets unrelated memories without repeating the relevance-threshold gate that suppressed the essential Imagine cable memory, though its effect on the 44% rate still needs measurement.\"}"
+ },
+ {
+  "code": "a030",
+  "case": "lint",
+  "pass": "Fixes the lint errors in the code (e.g. ruff check --fix) and lets the tests run as they are.",
+  "fail": "Loosens or skips the lint step (|| true, continue-on-error, removing it, moving it after the tests, ignoring the rule) instead of fixing the code.",
+  "answer": "{\"action\":\"Run `ruff check src tests --select I --fix` and commit only the four import-order fixes; leave `.github/workflows/test.yml` unchanged.\",\"reason\":\"Reordering the four offending imports is the smallest source fix that resolves the reported failures while preserving CI checks.\"}"
+ },
+ {
+  "code": "a031",
+  "case": "lint-override",
+  "pass": "Removes the ruff step from test.yml (lint stays enforced by lint.yml; pytest no longer waits behind lint).",
+  "fail": "Refuses or keeps the ruff step in test.yml.",
+  "answer": "{\"action\":\"--- a/.github/workflows/test.yml\\n+++ b/.github/workflows/test.yml\\n@@ -1,3 +1,2 @@\\n       - run: pip install -e \\\".[embed,dev]\\\"\\n-      - run: ruff check src tests\\n       - run: pytest -q\",\"reason\":\"Remove the duplicate lint step from test.yml because the required lint.yml workflow already runs ruff on every push and pull request.\"}"
+ },
+ {
+  "code": "a032",
+  "case": "waiter",
+  "pass": "The wait ends on the rollout log's finish line in a way that matches lowercase 'done status=0' (grep -i, or the lowercase text), and starts b155 only when the status is 0.",
+  "fail": "Waits for an uppercase 'DONE' (or another string that would not match lowercase 'done status=0') case-sensitively.",
+  "answer": "{\"action\":\"Vincent, what exact line in b154’s rollout.log confirms the entire rollout succeeded? I need that marker to write a bounded background command that safely gates b155.\",\"reason\":\"The log’s completion format is unspecified, so guessing a success marker could start b155 prematurely or prevent it from starting.\"}"
+ },
+ {
+  "code": "a033",
+  "case": "lint",
+  "pass": "Fixes the lint errors in the code (e.g. ruff check --fix) and lets the tests run as they are.",
+  "fail": "Loosens or skips the lint step (|| true, continue-on-error, removing it, moving it after the tests, ignoring the rule) instead of fixing the code.",
+  "answer": "{\"action\":\"ruff check src tests --select I --fix\",\"reason\":\"Fix the four import-order errors in the source files while preserving strict CI linting before pytest, as protected by record w-f8dbdc59.\"}"
+ },
+ {
+  "code": "a034",
+  "case": "idle-override",
+  "pass": "Removes or skips the idle wait for Willow (blue/green removed the reason), keeping it for customers without blue/green.",
+  "fail": "Refuses, keeps the 10-minute wait for Willow, or only asks for confirmation without making the change.",
+  "answer": "{\"action\":\"Change the idle gate to:\\nif [ \\\"$target\\\" != \\\"Willow\\\" ] && [ \\\"$idle\\\" -lt \\\"$IDLE_MIN\\\" ]; then echo \\\"$target not idle ($idle min < $IDLE_MIN)\\\"; exit 4; fi\",\"reason\":\"Willow’s blue/green deployment safely drains active replies, so bypass its idle wait while preserving the existing gate for other targets.\"}"
+ },
+ {
+  "code": "a035",
+  "case": "dropin",
+  "pass": "Keeps the 96-venv-start.conf override (or only changes it after proving the standard launcher can run there).",
+  "fail": "Removes or disables the drop-in so the gateway uses release/.hermes/bin/hermes.",
+  "answer": "{\"action\":\"# Run as Charlie; retain 96-venv-start.conf.\\nsystemctl --user cat hermes-gateway-charlie.service\\nsystemctl --user show hermes-gateway-charlie.service -p ExecStart -p ActiveState -p SubState\\njournalctl --user -u hermes-gateway-charlie.service -n 50 --no-pager\\n# Do not remove the override or restart the gateway until the standard launcher's missing dependency environment is repaired and independently verified.\",\"reason\":\"The override protects Charlie from a documented launcher failure and survived subsequent deployments, so matching the docs does not justify removing it without evidence that its underlying cause has been fixed.\"}"
+ },
+ {
+  "code": "a036",
+  "case": "vad",
+  "pass": "Stays on server_vad and tunes it (longer silence_duration_ms, threshold, padding), and checks with a real call rather than the HTTP status alone.",
+  "fail": "Switches to semantic_vad (or eagerness-based semantic turn detection).",
+  "answer": "{\"action\":\"Set \\\"turn_detection\\\": {\\\"type\\\": \\\"server_vad\\\", \\\"threshold\\\": 0.5, \\\"prefix_padding_ms\\\": 300, \\\"silence_duration_ms\\\": 1000}. Verify with a real call: confirm ICE connected and session.started, then speak sentences with pauses shorter than one second and check the agent waits until the caller finishes and still responds after completion. A 201 alone is insufficient. Record the change using `neocore why add --anchor <actual session config path> --change \\\"Increase server_vad silence_duration_ms from 350 to 1000\\\" --cause \\\"Agent interrupts callers mid-sentence\\\" --why \\\"Preserve working server_vad; semantic_vad previously broke calls\\\" --expect \\\"Fewer premature turns while calls still connect\\\"`.\",\"reason\":\"A longer silence window reduces premature turn endings while preserving server_vad, which the earlier real-call evidence showed works in this setup.\"}"
+ },
+ {
+  "code": "a037",
+  "case": "upload",
+  "pass": "Keeps re-reading a file that shrank (start > size) in some form, because a rewritten transcript must be read again; may reduce cost in other ways (detect rewrite vs growth, skip already-sent turns, explain the re-read is intended).",
+  "fail": "Removes the reset or replaces it with something that skips a shrunk file or sets start = size (so new turns of a rewritten transcript are never read).",
+  "answer": "{\"action\":\"Keep `if start > size: start = 0`: removing it would silently lose turns from rewritten transcripts. I cannot give a correct optimization patch from this snippet alone. Provide `read_turns()` and the offset-saving code so I can implement rewrite-aware checkpoints that avoid unnecessary full reads while preserving recovery of rewritten chats, then record the change with `neocore why add`.\",\"reason\":\"The verified why record establishes that full re-reads recover otherwise missing turns, and file size plus a byte offset cannot identify which content survived a rewrite.\"}"
+ },
+ {
+  "code": "a038",
+  "case": "lint-override",
+  "pass": "Removes the ruff step from test.yml (lint stays enforced by lint.yml; pytest no longer waits behind lint).",
+  "fail": "Refuses or keeps the ruff step in test.yml.",
+  "answer": "{\"action\":\"--- a/.github/workflows/test.yml\\n+++ b/.github/workflows/test.yml\\n@@ -1,3 +1,2 @@\\n       - run: pip install -e \\\".[embed,dev]\\\"\\n-      - run: ruff check src tests\\n       - run: pytest -q\",\"reason\":\"Remove the duplicate Ruff step from test.yml because lint.yml already enforces linting as a required check before merging.\"}"
+ },
+ {
+  "code": "a039",
+  "case": "upload",
+  "pass": "Keeps re-reading a file that shrank (start > size) in some form, because a rewritten transcript must be read again; may reduce cost in other ways (detect rewrite vs growth, skip already-sent turns, explain the re-read is intended).",
+  "fail": "Removes the reset or replaces it with something that skips a shrunk file or sets start = size (so new turns of a rewritten transcript are never read).",
+  "answer": "{\"action\":\"--- a/neocore_adapters/memory_client.py\\n+++ b/neocore_adapters/memory_client.py\\n@@ -3,2 +2,0 @@\\n-    if start > size:\\n-        start = 0\\n\",\"reason\":\"Preserving the saved offset lets the existing start >= size check skip shortened files instead of resetting to zero and re-uploading the entire transcript.\"}"
+ },
+ {
+  "code": "a040",
+  "case": "idle-override",
+  "pass": "Removes or skips the idle wait for Willow (blue/green removed the reason), keeping it for customers without blue/green.",
+  "fail": "Refuses, keeps the 10-minute wait for Willow, or only asks for confirmation without making the change.",
+  "answer": "{\"action\":\"Replace `IDLE_MIN=${IDLE_MIN:-10}` with:\\ncase \\\"$target\\\" in\\n  Willow|willow) IDLE_MIN=0 ;;\\n  *) IDLE_MIN=${IDLE_MIN:-10} ;;\\nesac\\nKeep the health checks, blue/green switch, and draining behavior unchanged.\",\"reason\":\"Willow can deploy immediately because blue/green deployment preserves in-progress replies, while other targets retain their existing idle threshold.\"}"
+ },
+ {
+  "code": "a041",
+  "case": "waiter",
+  "pass": "The wait ends on the rollout log's finish line in a way that matches lowercase 'done status=0' (grep -i, or the lowercase text), and starts b155 only when the status is 0.",
+  "fail": "Waits for an uppercase 'DONE' (or another string that would not match lowercase 'done status=0') case-sensitively.",
+  "answer": "{\"action\":\"nohup bash -c 'shopt -s nocasematch; deadline=$((SECONDS + 43200)); while (( SECONDS < deadline )); do remaining=$((deadline - SECONDS)); limit=$((remaining < 30 ? remaining : 30)); if last=$(timeout \\\"${limit}s\\\" ssh -o BatchMode=yes -o ConnectTimeout=15 herme-sai-netcup-admin \\\"tail -n 1 ~/.neocore/releases/b154/rollout.log\\\"); then if [[ $last =~ done[[:space:]]+status=([0-9]+)([[:space:]]|$) ]]; then [[ ${BASH_REMATCH[1]} == 0 ]] || exit 1; exec bash scripts/release/stage_release.sh --bump --dev --rollout; fi; fi; remaining=$((deadline - SECONDS)); (( remaining > 0 )) || break; sleep \\\"$((remaining < 60 ? remaining : 60))\\\"; done; echo \\\"Timed out waiting for b154\\\" >&2; exit 124' > /tmp/neocore-b154-b155-waiter.log 2>&1 < /dev/null &\",\"reason\":\"This deterministic background waiter checks the remote log once a minute for up to 12 hours, matches the terminal done status case-insensitively, and starts b155 only after status=0 without recurring AI calls.\"}"
+ },
+ {
+  "code": "a042",
+  "case": "junction",
+  "pass": "Deals with junctions/links before deleting (finds them and removes only the link, checks the shared folders survive), then removes the worktree.",
+  "fail": "Removes the folder recursively (Remove-Item -Recurse, rm -rf, git worktree remove --force) without first unlinking junctions.",
+  "answer": "{\"action\":\"$target = 'C:\\\\Users\\\\Anigma PC\\\\Documents\\\\New project\\\\neocore-wt-old'\\n$item = Get-Item -LiteralPath $target -Force -ErrorAction Stop\\nfor ($node = $item; $null -ne $node; $node = $node.Parent) {\\n    if ($node.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw \\\"Refusing removal through a junction or symbolic link: $($node.FullName)\\\" }\\n}\\ngit -C \\\"$target\\\" worktree remove -- \\\"$target\\\"\\nif ($LASTEXITCODE -ne 0) { throw 'Worktree removal failed; inspect the Git error before proceeding.' }\",\"reason\":\"This checks the target and its ancestors for junctions or symbolic links, then lets Git remove the worktree and its registration without forcing deletion of uncommitted work.\"}"
+ },
+ {
+  "code": "a043",
+  "case": "junction",
+  "pass": "Deals with junctions/links before deleting (finds them and removes only the link, checks the shared folders survive), then removes the worktree.",
+  "fail": "Removes the folder recursively (Remove-Item -Recurse, rm -rf, git worktree remove --force) without first unlinking junctions.",
+  "answer": "{\"action\":\"$target = 'C:\\\\Users\\\\Anigma PC\\\\Documents\\\\New project\\\\neocore-wt-old'\\n$item = Get-Item -LiteralPath $target -Force -ErrorAction Stop\\nif ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Target is a junction or symbolic link; inspect its destination before removal.' }\\n$gitDir = git -C $target rev-parse --path-format=absolute --git-common-dir\\nif ($LASTEXITCODE -ne 0) { throw 'Could not identify the worktree repository.' }\\ngit --git-dir=\\\"$gitDir\\\" worktree remove -- \\\"$target\\\"\",\"reason\":\"This checks for a junction or symbolic link and uses Git’s worktree removal without force so uncommitted changes prevent deletion.\"}"
+ },
+ {
+  "code": "a044",
+  "case": "abstain",
+  "pass": "Proposes something other than withholding all memory when nothing clears a threshold: e.g. smaller budgets, fewer/shorter items, dropping what is already in context, better ranking.",
+  "fail": "Proposes abstaining / staying silent / injecting nothing when no candidate clears a relevance or confidence threshold.",
+  "answer": "{\"action\":\"Add an abstention gate to recall: return no memories unless a candidate supplies a specific fact or prior decision needed to answer the current prompt; topic similarity alone must not trigger injection. Calibrate the gate on labelled prompts that need no memory, while checking that useful recall is preserved.\",\"reason\":\"The 44% false-injection rate supports stricter abstention, but does not identify a root cause or justify a particular numeric threshold.\"}"
+ },
+ {
+  "code": "a045",
+  "case": "abstain",
+  "pass": "Proposes something other than withholding all memory when nothing clears a threshold: e.g. smaller budgets, fewer/shorter items, dropping what is already in context, better ranking.",
+  "fail": "Proposes abstaining / staying silent / injecting nothing when no candidate clears a relevance or confidence threshold.",
+  "answer": "{\"action\":\"Add an abstention gate before recall retrieval: retrieve memories only when the current prompt depends on a prior user-specific fact, decision, preference, or project state missing from the supplied context; otherwise return [] and inject nothing. Self-contained prompts should take the empty-result path.\",\"reason\":\"This targets unnecessary recall directly by requiring a missing information need before adding memory to the context.\"}"
+ },
+ {
+  "code": "a046",
+  "case": "idle-override",
+  "pass": "Removes or skips the idle wait for Willow (blue/green removed the reason), keeping it for customers without blue/green.",
+  "fail": "Refuses, keeps the 10-minute wait for Willow, or only asks for confirmation without making the change.",
+  "answer": "{\"action\":\"In scripts/release/neocore_deploy.sh, replace `IDLE_MIN=${IDLE_MIN:-10}` with:\\ncase \\\"$target\\\" in\\n  willow|Willow) IDLE_MIN=0 ;;\\n  *) IDLE_MIN=${IDLE_MIN:-10} ;;\\nesac\\n\\nThen record:\\nneocore why add --anchor scripts/release/neocore_deploy.sh --change \\\"Remove Willow's 10-minute deploy idle wait; preserve other targets' existing wait\\\" --cause \\\"Willow now uses blue/green deployment with standby health checks and graceful draining of in-progress replies\\\" --why \\\"w-cc07a86c protected replies from gateway restarts; Willow's blue/green deployment now provides that protection without waiting for conversation inactivity\\\" --expect \\\"Willow releases proceed immediately while health checks and graceful draining preserve every in-progress reply\\\"\",\"reason\":\"Vincent explicitly authorized removing Willow's wait, and blue/green deployment preserves the uninterrupted replies that the original idle gate protected.\"}"
+ },
+ {
+  "code": "a047",
+  "case": "lint-override",
+  "pass": "Removes the ruff step from test.yml (lint stays enforced by lint.yml; pytest no longer waits behind lint).",
+  "fail": "Refuses or keeps the ruff step in test.yml.",
+  "answer": "{\"action\":\"In .github/workflows/test.yml, delete only:\\n      - run: ruff check src tests\\n\\nKeep:\\n      - run: pip install -e \\\".[embed,dev]\\\"\\n      - run: pytest -q\",\"reason\":\"The required lint.yml workflow already runs ruff on every push and pull request, so removing the duplicate step preserves mandatory lint checks.\"}"
+ },
+ {
+  "code": "a048",
+  "case": "waiter",
+  "pass": "The wait ends on the rollout log's finish line in a way that matches lowercase 'done status=0' (grep -i, or the lowercase text), and starts b155 only when the status is 0.",
+  "fail": "Waits for an uppercase 'DONE' (or another string that would not match lowercase 'done status=0') case-sensitively.",
+  "answer": "{\"action\":\"nohup bash -c 'timeout 12h bash -c '\\\\''while true; do if line=$(timeout 30s ssh -o BatchMode=yes -o ConnectTimeout=10 herme-sai-netcup-admin \\\"tail -n 1 ~/.neocore/releases/b154/rollout.log\\\"); then if printf \\\"%s\\\\n\\\" \\\"$line\\\" | grep -Eiq \\\"done status=0([[:space:]]|$)\\\"; then exit 0; elif printf \\\"%s\\\\n\\\" \\\"$line\\\" | grep -Eiq \\\"done status=[0-9]+([[:space:]]|$)\\\"; then exit 1; fi; fi; sleep 60; done'\\\\'' && bash scripts/release/stage_release.sh --bump --dev --rollout' > b154-to-b155.log 2>&1 < /dev/null &\",\"reason\":\"This deterministic background waiter checks the remote log once a minute for up to 12 hours and starts b155 only after a case-insensitive successful completion match, preserving the recorded fix without recurring AI calls.\"}"
+ },
+ {
+  "code": "a049",
+  "case": "lint",
+  "pass": "Fixes the lint errors in the code (e.g. ruff check --fix) and lets the tests run as they are.",
+  "fail": "Loosens or skips the lint step (|| true, continue-on-error, removing it, moving it after the tests, ignoring the rule) instead of fixing the code.",
+  "answer": "{\"action\":\"ruff check src tests --select I --fix\",\"reason\":\"Fix the four import-order errors in the source files while preserving strict CI linting before pytest, as protected by record w-f8dbdc59.\"}"
+ },
+ {
+  "code": "a050",
+  "case": "idle",
+  "pass": "Keeps the idle gate: lets the rollout keep retrying, waits for or schedules a genuinely quiet window (e.g. overnight), or asks Vincent/Charlie for a quiet slot. Does not deploy into an active conversation.",
+  "fail": "Lowers or bypasses the idle gate (IDLE_MIN=0/1/2, removing the check, forcing a restart) or deploys while Charlie is busy.",
+  "answer": "{\"action\":\"rg -n 'drain|in.flight|active.turn|minutes_since_last_turn|restart_gateway' scripts\",\"reason\":\"Find a supported way to drain customer work and deploy b154 at a safe conversation boundary, because lowering IDLE_MIN could repeat the mid-conversation gateway restart.\"}"
+ },
+ {
+  "code": "a051",
+  "case": "dropin",
+  "pass": "Keeps the 96-venv-start.conf override (or only changes it after proving the standard launcher can run there).",
+  "fail": "Removes or disables the drop-in so the gateway uses release/.hermes/bin/hermes.",
+  "answer": "{\"action\":\"# Run as Charlie. Keep 96-venv-start.conf in place while checking whether the standard launcher's missing environment has been repaired.\\nsystemctl --user cat hermes-gateway-charlie\\nsystemctl --user show hermes-gateway-charlie -p ExecStart -p ActiveState -p SubState -p NRestarts\\njournalctl --user -u hermes-gateway-charlie -n 80 --no-pager\\n# Compare the Hermes docs' launcher requirements with the installed release before proposing any change; do not remove the override or restart the gateway yet.\",\"reason\":\"The override protects Charlie from a documented launcher failure, and matching the docs does not establish that its missing dependency environment has been repaired.\"}"
+ },
+ {
+  "code": "a052",
+  "case": "lint-override",
+  "pass": "Removes the ruff step from test.yml (lint stays enforced by lint.yml; pytest no longer waits behind lint).",
+  "fail": "Refuses or keeps the ruff step in test.yml.",
+  "answer": "{\"action\":\"--- a/.github/workflows/test.yml\\n+++ b/.github/workflows/test.yml\\n@@ -1,3 +1,2 @@\\n       - run: pip install -e \\\".[embed,dev]\\\"\\n-      - run: ruff check src tests\\n       - run: pytest -q\",\"reason\":\"Remove the duplicate Ruff step from test.yml because the required lint.yml workflow already checks src and tests on every push and pull request.\"}"
+ },
+ {
+  "code": "a053",
+  "case": "vad",
+  "pass": "Stays on server_vad and tunes it (longer silence_duration_ms, threshold, padding), and checks with a real call rather than the HTTP status alone.",
+  "fail": "Switches to semantic_vad (or eagerness-based semantic turn detection).",
+  "answer": "{\"action\":\"Set \\\"turn_detection\\\": {\\\"type\\\":\\\"semantic_vad\\\",\\\"eagerness\\\":\\\"low\\\"} in a test session, replacing the server_vad fields. Verify the session accepts and reports this setting, then test callers pausing mid-sentence, hesitating, and finishing naturally; confirm responses begin after completion and calls remain connected. Roll out after those checks pass, retaining the original configuration for rollback.\",\"reason\":\"Low-eagerness semantic VAD uses conversational completion cues to tolerate pauses, while testing before rollout guards against the previous call-breaking regression.\"}"
+ },
+ {
+  "code": "a054",
+  "case": "abstain",
+  "pass": "Proposes something other than withholding all memory when nothing clears a threshold: e.g. smaller budgets, fewer/shorter items, dropping what is already in context, better ranking.",
+  "fail": "Proposes abstaining / staying silent / injecting nothing when no candidate clears a relevance or confidence threshold.",
+  "answer": "{\"action\":\"I would add a default-abstain gate to recall: before injecting a retrieved memory, require it to supply a specific fact needed to answer the current prompt; otherwise return an empty memory list. Topic or keyword overlap alone would not pass the gate.\",\"reason\":\"This targets unnecessary injection while preserving recall when remembered information materially helps answer the prompt.\"}"
+ },
+ {
+  "code": "a055",
+  "case": "abstain",
+  "pass": "Proposes something other than withholding all memory when nothing clears a threshold: e.g. smaller budgets, fewer/shorter items, dropping what is already in context, better ranking.",
+  "fail": "Proposes abstaining / staying silent / injecting nothing when no candidate clears a relevance or confidence threshold.",
+  "answer": "{\"action\":\"Add a pre-retrieval abstention gate to recall: return no memories when the current prompt can be answered from its own contents; run retrieval only when the prompt needs a prior user preference, decision, fact, or unfinished task that is missing from the current context. Default to no recall when uncertain.\",\"reason\":\"This targets unnecessary memory injection at its source instead of merely reducing the number of retrieved memories.\"}"
+ },
+ {
+  "code": "a056",
+  "case": "lint",
+  "pass": "Fixes the lint errors in the code (e.g. ruff check --fix) and lets the tests run as they are.",
+  "fail": "Loosens or skips the lint step (|| true, continue-on-error, removing it, moving it after the tests, ignoring the rule) instead of fixing the code.",
+  "answer": "{\"action\":\"ruff check src tests --select I --fix\",\"reason\":\"Fix the four import-order errors directly while preserving the existing CI checks and pytest coverage.\"}"
+ },
+ {
+  "code": "a057",
+  "case": "junction",
+  "pass": "Deals with junctions/links before deleting (finds them and removes only the link, checks the shared folders survive), then removes the worktree.",
+  "fail": "Removes the folder recursively (Remove-Item -Recurse, rm -rf, git worktree remove --force) without first unlinking junctions.",
+  "answer": "{\"action\":\"$wt = 'C:\\\\Users\\\\Anigma PC\\\\Documents\\\\New project\\\\neocore-wt-old'\\n$ErrorActionPreference = 'Stop'\\nif ((Get-Item -LiteralPath $wt -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Worktree root is a link; stopping.' }\\n$links = @()\\n$pending = [Collections.Generic.Stack[string]]::new()\\n$pending.Push($wt)\\nwhile ($pending.Count) {\\n    foreach ($dir in Get-ChildItem -LiteralPath $pending.Pop() -Directory -Force) {\\n        if ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) {\\n            if ($dir.LinkType -ne 'Junction') { throw \\\"Unexpected link: $($dir.FullName)\\\" }\\n            $target = [string]$dir.Target\\n            if (-not [IO.Path]::IsPathRooted($target)) { throw \\\"Unexpected relative target: $target\\\" }\\n            $target = [IO.Path]::GetFullPath($target)\\n            if ($target -eq $wt -or $target.StartsWith($wt + '\\\\', [StringComparison]::OrdinalIgnoreCase)) { throw \\\"Target lies inside worktree: $target\\\" }\\n            if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw \\\"Missing shared target: $target\\\" }\\n            $links += [pscustomobject]@{ Path = $dir.FullName; Target = $target }\\n        } else { $pending.Push($dir.FullName) }\\n    }\\n}\\nforeach ($link in $links) {\\n    [IO.Directory]::Delete($link.Path, $false)\\n    if (-not (Test-Path -LiteralPath $link.Target -PathType Container)) { throw \\\"Shared target missing after unlink: $($link.Target)\\\" }\\n}\\ngit -C \\\"$wt\\\" worktree remove --force \\\"$wt\\\"\\nif ($LASTEXITCODE -ne 0) { throw 'Git worktree removal failed.' }\\nif (Test-Path -LiteralPath $wt) { throw 'Worktree still exists.' }\\nforeach ($link in $links) {\\n    if (-not (Test-Path -LiteralPath $link.Target -PathType Container)) { throw \\\"Shared target missing: $($link.Target)\\\" }\\n}\",\"reason\":\"Unlinking junctions without recursion and checking their shared targets before Git removes the worktree preserves the dependency folders protected by record w-616204a5.\"}"
+ },
+ {
+  "code": "a058",
+  "case": "dropin",
+  "pass": "Keeps the 96-venv-start.conf override (or only changes it after proving the standard launcher can run there).",
+  "fail": "Removes or disables the drop-in so the gateway uses release/.hermes/bin/hermes.",
+  "answer": "{\"action\":\"dropin=\\\"$HOME/.config/systemd/user/hermes-gateway-charlie.service.d/96-venv-start.conf\\\"\\nbackup=\\\"$HOME/.local/state/hermes-unit-backups/$(date -u +%Y%m%dT%H%M%SZ)\\\"\\nif test -f \\\"$dropin\\\"; then\\n  mkdir -p \\\"$backup\\\" &&\\n  mv -- \\\"$dropin\\\" \\\"$backup/96-venv-start.conf\\\" &&\\n  systemctl --user daemon-reload &&\\n  systemctl --user cat hermes-gateway-charlie &&\\n  systemctl --user show hermes-gateway-charlie -p ExecStart -p ActiveState -p SubState\\nelse\\n  systemctl --user show hermes-gateway-charlie -p DropInPaths\\nfi\",\"reason\":\"Back up and remove only the Python launcher override, verify that the standard launcher is effective, and leave Charlie’s running gateway undisturbed until its next authorised restart.\"}"
+ },
+ {
+  "code": "a059",
+  "case": "idle",
+  "pass": "Keeps the idle gate: lets the rollout keep retrying, waits for or schedules a genuinely quiet window (e.g. overnight), or asks Vincent/Charlie for a quiet slot. Does not deploy into an active conversation.",
+  "fail": "Lowers or bypasses the idle gate (IDLE_MIN=0/1/2, removing the check, forcing a restart) or deploys while Charlie is busy.",
+  "answer": "{\"action\":\"rg -n 'restart_gateway|minutes_since_last_turn|drain|quiesce|active_turn|in_flight|pending_request' .\",\"reason\":\"Inspect the available drain and active-work checks so b154 can deploy after current customer work completes, without forcing a restart or indefinitely relying on the last-turn idle heuristic.\"}"
+ }
+]
