@@ -458,7 +458,9 @@ def capture(repo: Path, *, where: Path | None = None, limit: int = 200) -> dict[
         if len(parts) < 7:
             continue
         sha, parents, at, author, subject, trailers, body = parts[:7]
-        at = datetime.fromisoformat(at).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Python 3.10's fromisoformat does not accept a trailing "Z".
+        at = (datetime.fromisoformat(at.replace("Z", "+00:00"))
+              .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
         reverted = REVERT.search(body)
         if reverted:
             target = reverted.group(1)
