@@ -415,10 +415,10 @@ neocore why capture .               # from commits with Why: / Cause: / Expect: 
 
 `capture` also marks a change failed when a later commit reverts it. Records from every AI share
 one file, so a fix Codex made is explained to Claude Code before it touches the same code. The
-evaluation (`evals/why/RESULTS.md`) replays real incidents with no memory, the problem only, and
-the full record. Over 16 runs where the obvious fix would undo a safeguard, the agent kept it 5
-times with no memory, 5 with the problem only, and 16 with the full record. It still made the
-change when the safeguard's reason had gone.
+evaluation (`evals/why/RESULTS.md`) replays real incidents with no memory, the problem only, the
+change only, and the full record. Over 16 runs where the obvious fix would undo a safeguard, the
+agent kept it 4 times with no memory, 10 with the problem only, 12 with the change only, and 16
+with the full record. It still made the change when the safeguard's reason had gone.
 
 ## Updates
 
