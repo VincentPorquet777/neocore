@@ -1,6 +1,6 @@
 {
   "name": "neocore",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "description": "One memory for all your AI tools. NeoCore keeps a local, dated memory of your AI coding sessions and lets Codex search it, open it and add to it.",
   "author": {
     "name": "VincentPorquet777",

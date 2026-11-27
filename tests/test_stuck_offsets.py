@@ -104,3 +104,31 @@ def test_one_background_sync_per_machine(tmp_path: Path, monkeypatch: pytest.Mon
     stamp = (tmp_path / memory.SYNC_STAMP).stat().st_mtime
     assert not memory._sync_due(tmp_path, now=stamp + 60)
     assert memory._sync_due(tmp_path, now=stamp + memory.SYNC_EVERY)
+
+
+def test_a_transcript_rewritten_shorter_is_uploaded_again(tmp_path: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    # Claude Code rewrites long chats shorter. On 2026-11-25 seven busy chats had offsets past
+    # their end (359 MB offset, 30 MB file) and were never uploaded again.
+    from neocore.shared import client
+
+    root = tmp_path / "projects"
+    path = _jsonl(root / "p" / "s.jsonl", _claude("Is the ID verified?", "Yes, verified."))
+    monkeypatch.setattr(memory, "transcript_sources", lambda: [("claude-code", root, claude_turns)])
+    monkeypatch.setattr(client, "_key", lambda _: "key")
+    monkeypatch.setattr(client, "ensure_tunnel", lambda *_: True)
+    sent: list[Any] = []
+
+    def call(*args: Any) -> dict[str, Any]:
+        turns = args[3]["turns"]
+        sent.extend(turns)
+        return {"results": [{"status": "captured"} for _ in turns]}
+
+    monkeypatch.setattr(client, "_call", call)
+    remote = type("R", (), {"valid": True, "key_file": "k", "upload": True})()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / client.UPLOAD_OFFSETS).write_text(json.dumps({str(path): 359_666_337}))
+    counts = client.upload_new(remote, home)  # type: ignore[arg-type]
+    assert counts["captured"] == 1 and len(sent) == 1
+    assert json.loads((home / client.UPLOAD_OFFSETS).read_text()) == {str(path): path.stat().st_size}

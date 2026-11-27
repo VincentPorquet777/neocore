@@ -70,11 +70,9 @@ def _read_only(home: Path) -> Iterator[sqlite3.Connection]:
 
 def markdown(home: Path, out: Path, scope: str = "internal") -> dict[str, int]:
     """Write the memory of ``scope`` to ``out`` as Markdown notes; returns what was written."""
-    from neocore.assistant import prefs
+    from neocore.assistant import prefs, render, validity
     from neocore.assistant import profile as dev_profile
-    from neocore.assistant import render
     from neocore.assistant import sleep as dev_sleep
-    from neocore.assistant import validity
 
     if not (home / "neocore.db").exists():
         raise FileNotFoundError(f"no memory in {home}")
@@ -188,7 +186,7 @@ def markdown(home: Path, out: Path, scope: str = "internal") -> dict[str, int]:
         ["# NeoCore memory", "",
          f"Exported {time.strftime('%Y-%m-%d %H:%M')} from {home} (scope {scope}).", "",
          f"- [[Briefing]] · [[Learnt rules]] · [[Lessons]] ({counts['lessons']})",
-         f"- Facts by month: " + " · ".join(f"[[Facts/{m}|{m}]]" for m in sorted(by_month)),
+         "- Facts by month: " + " · ".join(f"[[Facts/{m}|{m}]]" for m in sorted(by_month)),
          f"- {counts['conversations']} conversations, {counts['turns']} messages, "
          f"{counts['facts']} facts", "", "## Latest conversations", ""]
         + [f"- {_day(at)} · {project} · [[{name}]]" for at, name, project in recent]))

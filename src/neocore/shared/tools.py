@@ -347,9 +347,8 @@ class Tools:
 
     def profile(self, args: dict[str, Any], scopes: frozenset[str]) -> str:
         """The user's briefing for exactly the caller's scopes (``neocore.assistant.profile``)."""
-        from neocore.assistant import profile as dev_profile
-
         from neocore.assistant import prefs as dev_prefs
+        from neocore.assistant import profile as dev_profile
 
         text = dev_profile.get(
             self.memory.home, scopes, rows=self._rows,

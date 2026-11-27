@@ -387,6 +387,25 @@ is away: a device's transcripts are its queue. Admin commands (`neocore server s
 Linux, macOS and Windows are in `scripts/install/`. Full guide:
 [docs/shared-memory.md](docs/shared-memory.md).
 
+## Updates
+
+NeoCore keeps itself up to date like any installed app. Once a day the background sync (the one
+your assistant's Stop hook already starts, with no model call) asks PyPI whether a newer
+`neocore-memory` is out. If one is, NeoCore installs it into its own Python, checks that the new
+version loads, and goes back to the old one if it does not. Your next prompt shows one line saying
+what happened.
+
+```bash
+neocore update            # check and install now
+neocore update status     # installed version, latest seen, last check
+neocore update auto off   # only tell me when an update is out
+neocore update auto on    # install updates automatically (the default)
+```
+
+Set `NEOCORE_NO_UPDATE=1` to turn checking off entirely. The check sends PyPI nothing but the
+request for the package's public page. A source checkout or an install from git is never replaced;
+NeoCore only tells you an update is out.
+
 ## Quick start: Hermes Agent
 
 NeoCore is a memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent)
