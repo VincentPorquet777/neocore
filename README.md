@@ -387,6 +387,39 @@ is away: a device's transcripts are its queue. Admin commands (`neocore server s
 Linux, macOS and Windows are in `scripts/install/`. Full guide:
 [docs/shared-memory.md](docs/shared-memory.md).
 
+## Why records: what was tried, shown before anyone changes it
+
+A lesson says something went wrong. It does not say what was tried, what the fix protects or
+how it turned out, so the next AI can repeat a fix that already failed, or take a safeguard for a
+bug and remove it. Google DeepMind's Self-Improvement Memory work (Nov 2026) found that
+"problem only" memory can do worse than none, and that what carries improvements across models
+is the record of the change: root cause, rationale, the predicted outcome and the observed one.
+
+A why record keeps exactly that, anchored to the files or names it concerns. When Claude Code is
+about to edit an anchored file, or run a command that changes it, that action is held once with
+the matching records as the reason, so they are read before anything changes; running it again
+goes through. Once per record per session, zero model calls. Reading a file, or writing a
+document that only mentions it, never triggers them. An anchor `A + B` needs both parts
+(`Remove-Item + neocore-wt-` is deleting a worktree, not working in one). This uses the
+before-action hook that `neocore setup` installs; the Claude Code plugin alone does not add it.
+
+```bash
+neocore why add --anchor scripts/deploy.sh --anchor IDLE_MIN \
+  --change "Deploy waits until the gateway has been idle 10 min" \
+  --cause "A restart mid-conversation dropped the reply in progress" \
+  --why "Never deploy into a live conversation" --expect "No lost replies"
+neocore why observe w-1a2b3c4d held "b152: busy customers waited, no lost replies"
+neocore why for scripts/deploy.sh   # what an AI would be shown
+neocore why capture .               # from commits with Why: / Cause: / Expect: lines
+```
+
+`capture` also marks a change failed when a later commit reverts it. Records from every AI share
+one file, so a fix Codex made is explained to Claude Code before it touches the same code. The
+evaluation (`evals/why/RESULTS.md`) replays real incidents with no memory, the problem only, the
+change only, and the full record. Over 16 runs where the obvious fix would undo a safeguard, the
+agent kept it 4 times with no memory, 10 with the problem only, 12 with the change only, and 16
+with the full record. It still made the change when the safeguard's reason had gone.
+
 ## Updates
 
 NeoCore keeps itself up to date like any installed app. Once a day the background sync (the one

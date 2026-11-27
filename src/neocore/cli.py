@@ -6,6 +6,7 @@
     neocore sift install [--force] | remove | status   (NeoSift, the local relevance filter)
     neocore share on | off | status | send | delete     (opt-in: help train NeoSift)
     neocore rules add | remove | list | check | build | stats | off | on   (``neocore rules -h``)
+    neocore why add | observe | for | list | capture   (why code is the way it is, shown before changes)
     neocore update [status | auto on|off]   install the newest release now (checked daily)
     neocore uninstall
     neocore doctor
@@ -744,6 +745,13 @@ def main(argv: list[str] | None = None) -> None:
     if argv[:1] == ["undo"]:
         undo_command(argv[1:])
         return
+    if argv[:1] == ["why"]:
+        from neocore.assistant import why
+
+        code = why.command(argv[1:])
+        if code == 0 and argv[1:2] in (["add"], ["capture"], ["retire"]):
+            refresh_rule_hooks()  # the before-action hook appears with the first record
+        sys.exit(code)
     if argv[:1] == ["update"]:
         from neocore import update
 

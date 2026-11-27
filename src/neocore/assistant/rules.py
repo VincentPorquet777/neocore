@@ -294,7 +294,7 @@ class SessionState:
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
+            tmp = self.path.with_suffix(f".{os.getpid()}.tmp")  # parallel tool calls
             tmp.write_text(json.dumps(self.data), encoding="utf-8")
             os.replace(tmp, self.path)
         except OSError:
@@ -506,11 +506,65 @@ def _settle(home: Path, state: SessionState, base: dict[str, Any], nxt: str) -> 
                 "next": nxt, "after_s": round(time.time() - float(p.get("at") or time.time()), 1)})
 
 
+WHY_TOOLS = re.compile(rf"^(?:{FAMILIES['write']}|{FAMILIES['shell']})$")
+
+
+WHY_HOSTS = {"claude-code"}  # Codex hooks have no matcher: every tool call would start Python
+WHY_HELD = ("This action was held once so you can read these records before anything changes. "
+            "Keep what they protect unless their reason no longer holds. If your action still "
+            "fits, run it again and it will go through.")
+
+
+def _why_on(host: str) -> bool:
+    """Active why records exist and this host gets them (``neocore.assistant.why``)."""
+    if host not in WHY_HOSTS:
+        return False
+    try:
+        from neocore.assistant import why
+
+        return why.has_active()
+    except Exception:
+        return False
+
+
+def _with_why(out: dict[str, Any], decision: Decision, host: str, tool: str, tool_input: Any,
+              state: SessionState, home: Path, base: dict[str, Any]) -> dict[str, Any]:
+    """Hold the first write or shell action that touches a why record, with the records as the
+    reason, so the AI reads them before the change and not with its result. Each record once
+    per session; a rule's bump or note on the same action is kept in the same answer."""
+    if not WHY_TOOLS.match(tool) or not _why_on(host):
+        return out
+    try:
+        from neocore.assistant import why
+
+        shown = set(state.data.get("why_shown") or [])
+        text, ids = why.for_action(tool_input, shown)
+    except Exception:
+        return out  # a broken ledger never costs the rules their answer
+    if not text:
+        return out
+    state.data["why_shown"] = sorted(shown | set(ids))
+    state.save()
+    _log(home, {**base, "event": "why", "records": ids, "tool": tool,
+                "input_head": action_text(tool_input)[:200]})
+    hso = out.get("hookSpecificOutput") or {}
+    reason = "\n\n".join(x for x in (hso.get("permissionDecisionReason"),
+                                     hso.get("additionalContext"), text,
+                                     "" if decision.kind == "bump" else WHY_HELD) if x)
+    held: dict[str, Any] = {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                   "permissionDecision": "deny",
+                                                   "permissionDecisionReason": reason}}
+    if host in NOTICE_HOSTS:
+        note = f"NeoCore: held once for why record{'s' if len(ids) > 1 else ''} {', '.join(ids)}"
+        held["systemMessage"] = "; ".join(x for x in (out.get("systemMessage"), note) if x)
+    return held
+
+
 def hook(event_name: str, host: str, event: dict[str, Any], home: Path | None = None) -> dict[str, Any]:
     """One hook call: the host's event in, the answer to print out ({} = no answer)."""
     home = home or rules_home()
     rules = load_rules(home / RULES_FILE, verified_only=True)
-    if not any(r.applies(host) for r in rules):
+    if not any(r.applies(host) for r in rules) and not _why_on(host):
         return {}
     session = str(event.get("session_id") or "")
     state = SessionState(home / STATE_DIR, f"{host}-{session}")
@@ -521,6 +575,8 @@ def hook(event_name: str, host: str, event: dict[str, Any], home: Path | None = 
         return {}
     if event_name == "compact":           # the AI has lost the rules it was shown
         state.rearm()
+        state.data["why_shown"] = []
+        state.save()
         return {}
     if event_name == "pre-tool":
         tool = str(event.get("tool_name") or "")
@@ -540,7 +596,8 @@ def hook(event_name: str, host: str, event: dict[str, Any], home: Path | None = 
             state.data["pending"] = {"point": "pre", "rules": d.rules,
                                      "sig": _sig(tool, tool_input), "at": time.time()}
             state.save()
-        return pre_tool_output(d, host, rules)
+        return _with_why(pre_tool_output(d, host, rules), d, host, tool, tool_input, state,
+                         home, base)
     if event_name == "stop":
         reply = str(event.get("last_assistant_message") or "")
         p = state.data.get("pending")
@@ -563,6 +620,8 @@ def hook(event_name: str, host: str, event: dict[str, Any], home: Path | None = 
     if event_name == "session-start":
         if str(event.get("source") or "") in ("compact", "clear"):
             state.rearm()
+            state.data["why_shown"] = []
+            state.save()
         return session_start_output(standing(rules, host))
     return {}
 
@@ -575,8 +634,11 @@ def hook_plan(rules: list[Rule], host: str) -> dict[str, str | None]:
     Claude Code gets a PreToolUse matcher built from the action triggers' tools, so tool calls no
     rule can match never start the check. Codex hooks run without a matcher (the check filters)."""
     live = [r for r in rules if r.applies(host)]
-    if not live:
+    why_on = _why_on(host)
+    if not live and not why_on:
         return {}
+    if not live:
+        return {"PreToolUse": WHY_TOOLS.pattern, "SessionStart": None}
     triggers = [t for r in live for t in r.triggers]
     action = [t for t in triggers if t.at == "action"]
     reply = any(t.at == "reply" for t in triggers)
@@ -586,9 +648,13 @@ def hook_plan(rules: list[Rule], host: str) -> dict[str, str | None]:
     if action:
         if host == "claude-code" and all(t.tool for t in action):
             specs = dict.fromkeys(expand_tool(t.tool) for t in action)
+            if why_on:
+                specs.update(dict.fromkeys([FAMILIES["write"], FAMILIES["shell"]]))
             plan["PreToolUse"] = "^(?:" + "|".join(f"(?:{s})" for s in specs) + ")$"
         else:
             plan["PreToolUse"] = None
+    if why_on and "PreToolUse" not in plan:
+        plan["PreToolUse"] = WHY_TOOLS.pattern
     if reply:
         plan["Stop"] = None
     if host == "claude-code":
@@ -980,7 +1046,7 @@ def main(argv: list[str] | None = None) -> None:
         if os.environ.get("NEOCORE_RULES_DISABLED"):
             return
         home = rules_home()
-        if (home / OFF_FILE).exists() or not (home / RULES_FILE).exists():
+        if (home / OFF_FILE).exists() or not ((home / RULES_FILE).exists() or _why_on(host)):
             return
         event = json.loads(sys.stdin.read() or "{}")
         out = hook(cmd, host, event if isinstance(event, dict) else {}, home)
