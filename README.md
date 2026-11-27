@@ -396,8 +396,12 @@ bug and remove it. Google DeepMind's Self-Improvement Memory work (Nov 2026) fou
 is the record of the change: root cause, rationale, the predicted outcome and the observed one.
 
 A why record keeps exactly that, anchored to the files or names it concerns. When Claude Code is
-about to edit an anchored file, or run a command that changes it, the matching records are added
-to that action, once per session, with zero model calls. Reading a file never triggers them.
+about to edit an anchored file, or run a command that changes it, that action is held once with
+the matching records as the reason, so they are read before anything changes; running it again
+goes through. Once per record per session, zero model calls. Reading a file, or writing a
+document that only mentions it, never triggers them. An anchor `A + B` needs both parts
+(`Remove-Item + neocore-wt-` is deleting a worktree, not working in one). This uses the
+before-action hook that `neocore setup` installs; the Claude Code plugin alone does not add it.
 
 ```bash
 neocore why add --anchor scripts/deploy.sh --anchor IDLE_MIN \

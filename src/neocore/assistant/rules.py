@@ -294,7 +294,7 @@ class SessionState:
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
+            tmp = self.path.with_suffix(f".{os.getpid()}.tmp")  # parallel tool calls
             tmp.write_text(json.dumps(self.data), encoding="utf-8")
             os.replace(tmp, self.path)
         except OSError:
@@ -509,39 +509,55 @@ def _settle(home: Path, state: SessionState, base: dict[str, Any], nxt: str) -> 
 WHY_TOOLS = re.compile(rf"^(?:{FAMILIES['write']}|{FAMILIES['shell']})$")
 
 
-def _why_on(host: str) -> bool:
-    """Why records exist and this host can take them as context (``neocore.assistant.why``)."""
-    if not HOST_CAN_NOTE.get(host):
-        return False
-    from neocore.assistant import why
+WHY_HOSTS = {"claude-code"}  # Codex hooks have no matcher: every tool call would start Python
+WHY_HELD = ("This action was held once so you can read these records before anything changes. "
+            "Keep what they protect unless their reason no longer holds. If your action still "
+            "fits, run it again and it will go through.")
 
-    return (why.home() / why.FILE).exists()
+
+def _why_on(host: str) -> bool:
+    """Active why records exist and this host gets them (``neocore.assistant.why``)."""
+    if host not in WHY_HOSTS:
+        return False
+    try:
+        from neocore.assistant import why
+
+        return why.has_active()
+    except Exception:
+        return False
 
 
 def _with_why(out: dict[str, Any], decision: Decision, host: str, tool: str, tool_input: Any,
               state: SessionState, home: Path, base: dict[str, Any]) -> dict[str, Any]:
-    """Add the why records this write or shell action touches, each once per session. A held
-    action (bump) shows them on its retry instead."""
-    if decision.kind == "bump" or not WHY_TOOLS.match(tool) or not _why_on(host):
+    """Hold the first write or shell action that touches a why record, with the records as the
+    reason, so the AI reads them before the change and not with its result. Each record once
+    per session; a rule's bump or note on the same action is kept in the same answer."""
+    if not WHY_TOOLS.match(tool) or not _why_on(host):
         return out
-    from neocore.assistant import why
+    try:
+        from neocore.assistant import why
 
-    shown = set(state.data.get("why_shown") or [])
-    text, ids = why.for_action(tool_input, shown)
+        shown = set(state.data.get("why_shown") or [])
+        text, ids = why.for_action(tool_input, shown)
+    except Exception:
+        return out  # a broken ledger never costs the rules their answer
     if not text:
         return out
     state.data["why_shown"] = sorted(shown | set(ids))
     state.save()
     _log(home, {**base, "event": "why", "records": ids, "tool": tool,
                 "input_head": action_text(tool_input)[:200]})
-    out = dict(out)
-    hso = dict(out.get("hookSpecificOutput") or {"hookEventName": "PreToolUse"})
-    hso["additionalContext"] = "\n\n".join(x for x in (hso.get("additionalContext"), text) if x)
-    out["hookSpecificOutput"] = hso
+    hso = out.get("hookSpecificOutput") or {}
+    reason = "\n\n".join(x for x in (hso.get("permissionDecisionReason"),
+                                     hso.get("additionalContext"), text,
+                                     "" if decision.kind == "bump" else WHY_HELD) if x)
+    held: dict[str, Any] = {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                   "permissionDecision": "deny",
+                                                   "permissionDecisionReason": reason}}
     if host in NOTICE_HOSTS:
-        note = f"NeoCore: showed why record{'s' if len(ids) > 1 else ''} {', '.join(ids)}"
-        out["systemMessage"] = "; ".join(x for x in (out.get("systemMessage"), note) if x)
-    return out
+        note = f"NeoCore: held once for why record{'s' if len(ids) > 1 else ''} {', '.join(ids)}"
+        held["systemMessage"] = "; ".join(x for x in (out.get("systemMessage"), note) if x)
+    return held
 
 
 def hook(event_name: str, host: str, event: dict[str, Any], home: Path | None = None) -> dict[str, Any]:

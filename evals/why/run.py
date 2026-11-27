@@ -9,16 +9,19 @@ what the AI does? Mirrors the Self-Improvement Memory ablation (none / problem o
 
 Retrieval loads every record into a temporary why home and sends each case's probe action (the
 tool call an agent would make) through ``neocore.assistant.rules.hook`` exactly as Claude Code
-would. Behavior shows the agent the task with no memory, with the problem only (what a NeoCore
-lesson says today), or with the full why record as the hook renders it, in a fresh Codex run
-with no user config, hooks, MCP servers or NeoCore memory.
+would. Behavior shows the agent the task with no memory, the problem only (what a NeoCore lesson
+says today), the change only (what was changed, no reasons), or the full why record as the hook
+renders it, in a fresh Codex run with no user config, hooks, MCP servers or NeoCore memory. Every
+arm gets the same instructions: the record-keeping tail the hook adds is left out of all of them.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).parent
-CONDITIONS = ("none", "problem", "full")
+CONDITIONS = ("none", "problem", "change", "full")
 
 
 def _cases() -> dict[str, Any]:
@@ -67,7 +70,7 @@ def retrieval() -> dict[str, Any]:
         event = {"session_id": f"s{n}", "tool_name": case["probe"]["tool"],
                  "tool_input": case["probe"]["input"]}
         out = rules.hook("pre-tool", "claude-code", event)
-        text = (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
+        text = (out.get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
         shown = [k for k, i in ids.items() if f"[{i}]" in text]
         rows.append({"case": case["id"], "want": case["record"], "shown": shown,
                      "hit": case["record"] in shown, "extra": [k for k in shown if k != case["record"]]})
@@ -91,7 +94,7 @@ def _tool_calls(paths: list[Path]):
                 continue
             for block in ((row.get("message") or {}).get("content") or []):
                 if isinstance(block, dict) and block.get("type") == "tool_use":
-                    yield block.get("name", ""), block.get("input")
+                    yield path, block.get("name", ""), block.get("input")
 
 
 def replay(folder: Path, limit: int = 60) -> dict[str, Any]:
@@ -102,20 +105,26 @@ def replay(folder: Path, limit: int = 60) -> dict[str, Any]:
     names = {v: k for k, v in ids.items()}
     records = why.load()
     paths = sorted(folder.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)[-limit:]
-    total = 0
+    total = calls = 0
     fired: dict[str, int] = {}
     samples: dict[str, list[str]] = {}
-    for tool, tool_input in _tool_calls(paths):
+    holds: set[tuple[str, str]] = set()  # (transcript, record): once per session, as the hook does
+    for path, tool, tool_input in _tool_calls(paths):
         if not rules.WHY_TOOLS.match(tool):
             continue
         total += 1
-        for record, hit in why.relevant(records, tool_input):
+        found = why.relevant(records, tool_input)
+        calls += bool(found)
+        for record, hit in found:
             key = names[record["id"]]
             fired[key] = fired.get(key, 0) + 1
+            holds.add((path.name, key))
             if len(samples.setdefault(key, [])) < 3:
                 samples[key].append(f"{tool}: {rules.action_text(tool_input)[:160]!r}")
     return {"transcripts": len(paths), "write_or_shell_calls": total,
-            "calls_with_a_record": sum(fired.values()), "by_record": fired, "samples": samples}
+            "calls_with_a_record": calls, "holds_once_per_session": len(holds),
+            "transcripts_with_a_hold": len({t for t, _ in holds}), "by_record": fired,
+            "samples": samples}
 
 
 PROMPT = """You are an AI coding agent working for Vincent on his projects. Answer directly from \
@@ -138,7 +147,9 @@ def _memory(case: dict[str, Any], record: dict[str, Any], condition: str) -> str
         return ("\n\n<neocore_memory>\nWatch out (lessons from earlier mistakes):\n"
                 f"- {day} · {record['by']}: {case['problem']}\n</neocore_memory>")
     found = why.relevant([record], case["probe"]["input"])
-    return "\n\n" + why.context(found)
+    if not found:
+        raise SystemExit(f"{case['id']}: the probe does not reach record {case['record']}")
+    return "\n\n" + why.context(found, condition, tail=False)
 
 
 def _codex() -> str:
@@ -170,7 +181,12 @@ def behavior(out_dir: Path, reps: int = 2, model: str = "gpt-6.1-sol", workers: 
     from neocore.assistant import why
 
     root, ids, spec = _home()
-    records = {k: r for k, r in ((k, {r["id"]: r for r in why.load()}[i]) for k, i in ids.items())}
+    by_id = {r["id"]: r for r in why.load()}
+    records = {k: by_id[i] for k, i in ids.items()}
+    revision = subprocess.run(["git", "-C", str(HERE), "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+    dirty = bool(subprocess.run(["git", "-C", str(HERE), "status", "--porcelain", "--", "."],
+                                capture_output=True, text=True).stdout.strip())
     out_dir.mkdir(parents=True, exist_ok=True)
     exe = _codex()
     jobs = []
@@ -189,9 +205,11 @@ def behavior(out_dir: Path, reps: int = 2, model: str = "gpt-6.1-sol", workers: 
     def run(job: tuple[str, str, str, int, str]) -> None:
         name, case_id, condition, rep, prompt = job
         started = time.time()
-        answer = _ask(exe, prompt, model, root / "runs" / name)
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        answer = _ask(exe, prompt, model, root / "runs" / digest[:16])  # no arm in the path
         (out_dir / f"{name}.json").write_text(json.dumps({
             "case": case_id, "condition": condition, "rep": rep, "model": model,
+            "revision": revision + ("+dirty" if dirty else ""), "prompt_sha256": digest,
             "seconds": round(time.time() - started, 1), "prompt": prompt, "answer": answer},
             indent=1, ensure_ascii=False), encoding="utf-8")
         print(f"done {name} ({time.time() - started:.0f}s)", flush=True)
@@ -210,8 +228,9 @@ def blind(out_dir: Path) -> None:
         code = f"a{n:03d}"
         key[code] = f"{row['case']}__{row['condition']}__{row['rep']}"
         case = spec[row["case"]]
+        answer = re.sub(r"\bw-[0-9a-f]{8}\b", "w-XXXXXXXX", row["answer"])  # hides the arm
         items.append({"code": code, "case": row["case"], "pass": case["pass"],
-                      "fail": case["fail"], "answer": row["answer"]})
+                      "fail": case["fail"], "answer": answer})
     (out_dir / "blind_key.json").write_text(json.dumps(key, indent=1), encoding="utf-8")
     (out_dir / "blind.json").write_text(json.dumps(items, indent=1, ensure_ascii=False),
                                         encoding="utf-8")
